@@ -1,0 +1,8 @@
+build/
+build-*/
+*.o
+*.a
+*.air
+*.metallib
+.cache/
+.DS_Store
