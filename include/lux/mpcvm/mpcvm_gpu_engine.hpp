@@ -60,4 +60,11 @@ protected:
     MPCVMGPUEngine& operator=(const MPCVMGPUEngine&) = delete;
 };
 
+// Sibling factory: wgpu-native (WebGPU) engine. Always declared so the
+// determinism harness can compare WGSL output against the platform-canonical
+// engine returned by MPCVMGPUEngine::create() (Metal on Apple, CUDA on Linux+CUDA).
+// Returns nullptr when LUX_MPCVM_ENABLE_WGPU is OFF or no compatible adapter
+// is available.
+std::unique_ptr<MPCVMGPUEngine> create_mpcvm_wgpu_engine();
+
 }  // namespace mpcvm::gpu

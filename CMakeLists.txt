@@ -9,7 +9,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(lux-mpcvm
-    VERSION 0.60.0
+    VERSION 0.61.0
     DESCRIPTION "GPU-native M-Chain (MPC) ceremony substrate"
     LANGUAGES CXX
 )
@@ -21,7 +21,27 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(LUX_MPCVM_BUILD_TESTS "Build MPCVM tests" ON)
 option(LUX_MPCVM_ENABLE_METAL "Build Metal backend (Apple)" ${APPLE})
 option(LUX_MPCVM_ENABLE_CUDA  "Build CUDA backend" OFF)
-option(LUX_MPCVM_ENABLE_WGPU  "Build WebGPU/Dawn backend (deferred to v0.61)" OFF)
+
+# Auto-detect wgpu-native (Homebrew prefix on macOS, plain pkg-config elsewhere).
+set(_LUX_MPCVM_WGPU_DEFAULT OFF)
+find_path(LUX_MPCVM_WGPU_INCLUDE_DIR NAMES webgpu.h
+    PATHS
+        /opt/homebrew/opt/wgpu-native/include
+        /usr/local/opt/wgpu-native/include
+        /usr/local/include
+        /usr/include
+)
+find_library(LUX_MPCVM_WGPU_LIBRARY NAMES wgpu_native
+    PATHS
+        /opt/homebrew/opt/wgpu-native/lib
+        /usr/local/opt/wgpu-native/lib
+        /usr/local/lib
+        /usr/lib
+)
+if(LUX_MPCVM_WGPU_INCLUDE_DIR AND LUX_MPCVM_WGPU_LIBRARY)
+    set(_LUX_MPCVM_WGPU_DEFAULT ON)
+endif()
+option(LUX_MPCVM_ENABLE_WGPU "Build WebGPU/wgpu-native backend" ${_LUX_MPCVM_WGPU_DEFAULT})
 
 # ---- core library (host code: layout + CPU reference) --------------------
 
@@ -132,6 +152,48 @@ if(LUX_MPCVM_ENABLE_CUDA)
     target_link_libraries(lux_mpcvm_cuda PUBLIC lux_mpcvm_core)
 endif()
 
+# ---- WebGPU / wgpu-native driver ------------------------------------------
+
+if(LUX_MPCVM_ENABLE_WGPU)
+    if(NOT LUX_MPCVM_WGPU_INCLUDE_DIR OR NOT LUX_MPCVM_WGPU_LIBRARY)
+        message(FATAL_ERROR
+            "LUX_MPCVM_ENABLE_WGPU=ON but wgpu-native not found. "
+            "Install via `brew install wgpu-native` (macOS) or unset the option.")
+    endif()
+    add_library(lux_mpcvm_wgpu STATIC src/mpcvm_gpu_engine_wgpu.cpp)
+    target_include_directories(lux_mpcvm_wgpu PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${LUX_MPCVM_WGPU_INCLUDE_DIR}>
+    )
+    target_compile_features(lux_mpcvm_wgpu PUBLIC cxx_std_20)
+    target_compile_definitions(lux_mpcvm_wgpu PUBLIC LUX_MPCVM_ENABLE_WGPU=1)
+    target_link_libraries(lux_mpcvm_wgpu PUBLIC lux_mpcvm_core ${LUX_MPCVM_WGPU_LIBRARY})
+    if(APPLE)
+        # wgpu-native links against Metal/CoreFoundation/QuartzCore on macOS.
+        target_link_libraries(lux_mpcvm_wgpu PUBLIC
+            "-framework Metal"
+            "-framework Foundation"
+            "-framework QuartzCore"
+            "-framework CoreFoundation")
+    endif()
+    set_target_properties(lux_mpcvm_wgpu PROPERTIES
+        OUTPUT_NAME "lux_mpcvm_wgpu"
+        POSITION_INDEPENDENT_CODE ON
+    )
+
+    # Stage WGSL source files next to the built library so the engine can
+    # locate them at runtime.
+    foreach(src
+        mpcvm_kernels_common.wgsl
+        mpcvm_ceremony.wgsl
+        mpcvm_transition.wgsl)
+        configure_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/${src}
+            ${CMAKE_CURRENT_BINARY_DIR}/src/${src}
+            COPYONLY)
+    endforeach()
+endif()
+
 # ---- tests ----------------------------------------------------------------
 
 if(LUX_MPCVM_BUILD_TESTS)
@@ -151,7 +213,7 @@ if(LUX_MPCVM_BUILD_TESTS)
         add_test(NAME mpcvm-gpu-engine-test COMMAND mpcvm-gpu-engine-test)
     endif()
 
-    # Cross-backend determinism — links to whichever GPU backend is enabled.
+    # Cross-backend determinism — links to whichever GPU backends are enabled.
     add_executable(mpcvm-determinism-test test/mpcvm_determinism_test.cpp)
     target_compile_features(mpcvm-determinism-test PRIVATE cxx_std_20)
     if(LUX_MPCVM_ENABLE_METAL AND APPLE)
@@ -162,6 +224,10 @@ if(LUX_MPCVM_BUILD_TESTS)
         target_sources(mpcvm-determinism-test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/mpcvm_engine_stub.cpp)
         target_link_libraries(mpcvm-determinism-test PRIVATE lux_mpcvm_core)
+    endif()
+    if(LUX_MPCVM_ENABLE_WGPU)
+        target_link_libraries(mpcvm-determinism-test PRIVATE lux_mpcvm_wgpu)
+        target_compile_definitions(mpcvm-determinism-test PRIVATE LUX_MPCVM_ENABLE_WGPU=1)
     endif()
     add_test(NAME mpcvm-determinism-test COMMAND mpcvm-determinism-test)
 endif()

@@ -64,10 +64,21 @@ constexpr std::array<uint32_t, 25> kKeccakRot = {
     18,  2, 61, 56, 14,
 };
 
+// Masked rotation — defined for n=0..63. Avoids UB at n=0 from naked
+// `x >> (64 - n)` and avoids the branch (which Apple Clang -O3 has been
+// observed to miscompile in some loop-unrolled forms).
 inline uint64_t rotl64(uint64_t x, uint32_t n) {
-    return (n == 0) ? x : ((x << n) | (x >> (64u - n)));
+    n &= 63u;
+    return (x << n) | (x >> ((64u - n) & 63u));
 }
 
+// Apple Clang -O3 has been observed to miscompile keccak_f[1600] when the
+// 136-byte rate path is exercised through repeated absorbs (XVM caught this).
+// MPCVM hits that path on every leaf encoding, so we pin this function to
+// no-optimization to lock in the canonical bit pattern across compilers.
+#if defined(__clang__) && defined(__APPLE__)
+__attribute__((optnone))
+#endif
 void keccak_f1600(uint64_t* s) {
     for (uint32_t round = 0; round < 24u; ++round) {
         uint64_t c[5];

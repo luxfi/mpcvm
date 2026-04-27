@@ -166,7 +166,10 @@ constexpr uint32_t kSchemeCggmp21  = 1u;
 constexpr uint32_t kSchemeRingtail = 2u;
 
 __device__ inline uint64_t rotl64(uint64_t x, uint32_t n) {
-    return (x << n) | (x >> (64u - n));
+    // Masked rotation — defined for any n. Avoids UB on n=0 where the
+    // naked `x >> (64 - n)` becomes `x >> 64`.
+    n &= 63u;
+    return (x << n) | (x >> ((64u - n) & 63u));
 }
 
 __device__ inline void keccak_f1600(uint64_t* s) {

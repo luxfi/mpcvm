@@ -299,6 +299,114 @@ void test_two_engines_match(MPCVMGPUEngine* engine)
 
 }  // namespace
 
+#ifdef LUX_MPCVM_ENABLE_WGPU
+namespace {
+
+void run_wgpu_workload_set(MPCVMGPUEngine* wgpu)
+{
+    if (wgpu == nullptr) {
+        std::printf("  note: WGPU engine factory returned null (no adapter?)\n");
+        return;
+    }
+    std::printf("  wgpu device: %s\n", wgpu->device_name());
+
+    auto dump_root = [](const char* tag, const uint8_t* r) {
+        std::printf("    %s: ", tag);
+        for (int i = 0; i < 8; ++i) std::printf("%02x", r[i]);
+        std::printf("..\n");
+    };
+    auto compare = [&](const char* label,
+                       const std::vector<CeremonyOp>& begins,
+                       const std::vector<ContributionOp>& cnts,
+                       const MPCVMRoundDescriptor& desc)
+    {
+        auto cpu  = run_cpu(desc, begins, cnts);
+        auto gpuw = run_gpu(wgpu, desc, begins, cnts);
+        bool eq = cpu.equals(gpuw);
+        if (!eq) {
+            std::printf("  diff[%s]: applied cer cpu=%u wgpu=%u  cnt cpu=%u wgpu=%u  adv cpu=%u wgpu=%u  fail cpu=%u wgpu=%u\n",
+                label,
+                cpu.ceremony_apply_count, gpuw.ceremony_apply_count,
+                cpu.contribution_apply_count, gpuw.contribution_apply_count,
+                cpu.round_advance_count, gpuw.round_advance_count,
+                cpu.failed_this_round, gpuw.failed_this_round);
+            dump_root("cpu cer", cpu.ceremony_root);
+            dump_root("wgp cer", gpuw.ceremony_root);
+            dump_root("cpu cnt", cpu.contribution_root);
+            dump_root("wgp cnt", gpuw.contribution_root);
+            dump_root("cpu shr", cpu.key_share_root);
+            dump_root("wgp shr", gpuw.key_share_root);
+            dump_root("cpu st",  cpu.mpcvm_state_root);
+            dump_root("wgp st",  gpuw.mpcvm_state_root);
+        }
+        EXPECT(label, eq);
+        PASS(label);
+    };
+
+    // 1. FROST 7-of-10 keygen round 0.
+    {
+        std::vector<CeremonyOp> begins{
+            make_begin(142u, 7u, 10u, static_cast<uint32_t>(CeremonyKind::FrostKeygen)),
+        };
+        std::vector<ContributionOp> r0;
+        for (uint32_t i = 0; i < 7u; ++i) r0.push_back(make_contribution(142u, 0u, i, 0xC1u));
+        compare("WGPU frost.kg0", begins, r0, make_desc(1u));
+    }
+    // 2. CGGMP21 5-of-9 keygen round 0.
+    {
+        std::vector<CeremonyOp> begins{
+            make_begin(207u, 5u, 9u, static_cast<uint32_t>(CeremonyKind::Cggmp21Keygen)),
+        };
+        std::vector<ContributionOp> r0;
+        for (uint32_t i = 0; i < 5u; ++i) r0.push_back(make_contribution(207u, 0u, i, 0xA1u));
+        compare("WGPU cgg.kg0", begins, r0, make_desc(1u));
+    }
+    // 3. Replay dropped.
+    {
+        std::vector<CeremonyOp> begins{
+            make_begin(311u, 3u, 5u, static_cast<uint32_t>(CeremonyKind::FrostSign)),
+        };
+        std::vector<ContributionOp> ops{
+            make_contribution(311u, 0u, 0u),
+            make_contribution(311u, 0u, 0u, 0xFEu),
+        };
+        compare("WGPU replay.dropped", begins, ops, make_desc(1u));
+    }
+    // 4. Timeout sweep.
+    {
+        std::vector<CeremonyOp> begins{
+            make_begin(413u, 7u, 10u, static_cast<uint32_t>(CeremonyKind::FrostKeygen),
+                       /*deadline=*/1000ULL),
+        };
+        std::vector<ContributionOp> r0;
+        for (uint32_t i = 0; i < 5u; ++i) r0.push_back(make_contribution(413u, 0u, i));
+        compare("WGPU timeout", begins, r0, make_desc(1u, /*now=*/2000ULL));
+    }
+    // 5. 3-way concurrent ceremonies.
+    {
+        std::vector<CeremonyOp> begins{
+            make_begin(501u, 7u, 10u, static_cast<uint32_t>(CeremonyKind::FrostKeygen),
+                       2000000000000000000ULL, 0xA1),
+            make_begin(502u, 5u, 9u,  static_cast<uint32_t>(CeremonyKind::Cggmp21Keygen),
+                       2000000000000000000ULL, 0xB1),
+            make_begin(503u, 3u, 5u,  static_cast<uint32_t>(CeremonyKind::FrostSign),
+                       2000000000000000000ULL, 0xC1),
+        };
+        std::vector<ContributionOp> r0;
+        for (uint32_t i = 0; i < 7u; ++i) r0.push_back(make_contribution(501u, 0u, i, 0xA1u));
+        for (uint32_t i = 0; i < 5u; ++i) r0.push_back(make_contribution(502u, 0u, i, 0xB1u));
+        for (uint32_t i = 0; i < 3u; ++i) r0.push_back(make_contribution(503u, 0u, i, 0xC1u));
+        compare("WGPU 3-way concurrent", begins, r0, make_desc(1u));
+    }
+    // 6. Empty round.
+    {
+        compare("WGPU empty round", {}, {}, make_desc(1u));
+    }
+}
+
+}  // namespace
+#endif  // LUX_MPCVM_ENABLE_WGPU
+
 int main(int /*argc*/, char** /*argv*/)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -318,6 +426,12 @@ int main(int /*argc*/, char** /*argv*/)
     test_concurrent_ceremonies(engine.get());
     test_empty_round(engine.get());
     test_two_engines_match(engine.get());
+
+#ifdef LUX_MPCVM_ENABLE_WGPU
+    std::printf("[mpcvm_determinism_test] WGPU 4-way determinism\n");
+    auto wgpu_engine = create_mpcvm_wgpu_engine();
+    run_wgpu_workload_set(wgpu_engine.get());
+#endif
 
     std::printf("[mpcvm_determinism_test] passed=%d failed=%d\n",
                 g_passed, g_failed);
