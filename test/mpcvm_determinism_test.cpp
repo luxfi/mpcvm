@@ -272,6 +272,48 @@ void test_empty_round(MPCVMGPUEngine* engine)
     PASS("Empty round deterministic non-zero");
 }
 
+// Build a sized workload of `count` finalizing FROST 7-of-10 keygens. Each
+// ceremony has 7 contributions for round 0; the sweep advances round 0->1.
+// Used to exercise per-slot fan-out at scale.
+void make_sized_workload(uint64_t count, uint64_t cid_base,
+                         std::vector<CeremonyOp>& begins,
+                         std::vector<ContributionOp>& contribs)
+{
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t cid = cid_base + i;
+        begins.push_back(make_begin(cid, 7u, 10u,
+            static_cast<uint32_t>(CeremonyKind::FrostKeygen),
+            /*deadline=*/2000000000000000000ULL,
+            /*fill=*/uint8_t(0xC0u + (cid & 0x0Fu))));
+        for (uint32_t h = 0; h < 7u; ++h) {
+            contribs.push_back(make_contribution(cid, 0u, h,
+                /*fill=*/uint8_t(0xC0u + (cid & 0x0Fu))));
+        }
+    }
+}
+
+void test_sized(MPCVMGPUEngine* engine, const char* label, uint64_t count)
+{
+    std::vector<CeremonyOp> begins;
+    std::vector<ContributionOp> contribs;
+    make_sized_workload(count, 1000u, begins, contribs);
+    auto desc = make_desc(1u);
+    auto cpu = run_cpu(desc, begins, contribs);
+    if (engine != nullptr) {
+        auto gpu = run_gpu(engine, desc, begins, contribs);
+        bool eq = cpu.equals(gpu);
+        if (!eq) {
+            std::printf("  diff[%s]: applied cer cpu=%u gpu=%u  cnt cpu=%u gpu=%u  adv cpu=%u gpu=%u\n",
+                label,
+                cpu.ceremony_apply_count, gpu.ceremony_apply_count,
+                cpu.contribution_apply_count, gpu.contribution_apply_count,
+                cpu.round_advance_count, gpu.round_advance_count);
+        }
+        EXPECT(label, eq);
+    }
+    PASS(label);
+}
+
 void test_two_engines_match(MPCVMGPUEngine* engine)
 {
     if (engine == nullptr) {
@@ -402,6 +444,17 @@ void run_wgpu_workload_set(MPCVMGPUEngine* wgpu)
     {
         compare("WGPU empty round", {}, {}, make_desc(1u));
     }
+    // 7-10. Sized workloads (per-slot fan-out at scale).
+    auto sized = [&](const char* label, uint64_t count) {
+        std::vector<CeremonyOp> begins;
+        std::vector<ContributionOp> contribs;
+        make_sized_workload(count, 2000u, begins, contribs);
+        compare(label, begins, contribs, make_desc(1u));
+    };
+    sized("WGPU sized.small  (10)",  10u);
+    sized("WGPU sized.medium (50)",  50u);
+    sized("WGPU sized.large  (100)", 100u);
+    sized("WGPU sized.xlarge (200)", 200u);
 }
 
 }  // namespace
@@ -425,6 +478,16 @@ int main(int /*argc*/, char** /*argv*/)
     test_timeout(engine.get());
     test_concurrent_ceremonies(engine.get());
     test_empty_round(engine.get());
+
+    // v0.62: per-slot fan-out determinism at scale.
+    // Sizes mirror the benchmark suite (small/medium/large/xlarge), bounded
+    // by arena (256 ceremonies × 4096 contributions per round). xlarge
+    // tests an N=200 workload that uses 1400 contributions in round 0.
+    test_sized(engine.get(), "sized.small  (10 ceremonies)",  10u);
+    test_sized(engine.get(), "sized.medium (50 ceremonies)",  50u);
+    test_sized(engine.get(), "sized.large  (100 ceremonies)", 100u);
+    test_sized(engine.get(), "sized.xlarge (200 ceremonies)", 200u);
+
     test_two_engines_match(engine.get());
 
 #ifdef LUX_MPCVM_ENABLE_WGPU

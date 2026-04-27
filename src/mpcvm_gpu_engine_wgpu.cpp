@@ -3,17 +3,18 @@
 //
 // mpcvm_gpu_engine_wgpu.cpp — WebGPU/wgpu-native driver for MPCVMGPUEngine.
 //
-// One round = two sequential dispatches:
-//   1. mpcvm_ceremony_step  (begin/cancel + contributions + sweep + share emit)
-//   2. mpcvm_transition     (root composition + epoch advance)
+// v0.62: per-slot fan-out + parallel leaf reduction (mirrors Metal split).
+// One round = four sequential dispatches:
+//   1. mpcvm_ceremony_apply  (1x1x1) — Phase 1+2 ops apply, serial
+//   2. mpcvm_ceremony_sweep  (kCeremonySlots threads, 1 workgroup) —
+//                              Phase 3 sweep with intra-workgroup
+//                              prefix-sum for share_id allocation
+//   3. mpcvm_compute_leaves  (max(slot counts) threads, 64-thread groups) —
+//                              parallel keccak of leaves
+//   4. mpcvm_compose_root    (1x1x1) — serial fold + state-root composition
 //
-// Both kernels are workgroup_size(1) — canonical in-order traversal that
-// matches CPU/Metal/CUDA byte-for-byte. Determinism contract is covered
-// by mpcvm_determinism_test.cpp.
-//
-// When LUX_MPCVM_ENABLE_WGPU is OFF (default outside this module), the
-// MPCVMGPUEngine::create() weak fallback in this TU returns nullptr and the
-// determinism test runs CPU-only.
+// All entry points are byte-equal to the Metal peer; determinism is
+// covered by mpcvm_determinism_test.cpp.
 
 #include "lux/mpcvm/mpcvm_gpu_engine.hpp"
 
@@ -42,6 +43,8 @@ constexpr uint32_t kCeremonySlots     = kDefaultCeremonySlots;
 constexpr uint32_t kKeyShareSlots     = kDefaultKeyShareSlots;
 constexpr uint32_t kContributionSlots = kDefaultContributionSlots;
 constexpr uint32_t kMaxOpsPerRound    = 4096u;
+constexpr uint32_t kSweepThreads      = kCeremonySlots;
+constexpr uint32_t kLeafThreads       = kContributionSlots;  // ≥ all other slot counts
 
 WGPUStringView mk_sv(const char* s) {
     WGPUStringView v{};
@@ -57,7 +60,6 @@ WGPUStringView mk_sv(const std::string& s) {
     return v;
 }
 
-// Synchronous adapter request via spinning instance event-pump.
 struct AdapterAwait {
     WGPUAdapter adapter = nullptr;
     bool done = false;
@@ -102,7 +104,6 @@ void on_map(WGPUMapAsyncStatus status, WGPUStringView /*msg*/,
     a->done = true;
 }
 
-// Read kernel source files relative to this TU.
 bool read_file(const std::filesystem::path& p, std::string& out) {
     std::ifstream f(p);
     if (!f.is_open()) return false;
@@ -126,8 +127,6 @@ bool load_wgsl_sources(std::string& ceremony_src, std::string& transition_src) {
         if (read_file(dir / "mpcvm_kernels_common.wgsl", common)
             && read_file(dir / "mpcvm_ceremony.wgsl", kcer)
             && read_file(dir / "mpcvm_transition.wgsl", ktr)) {
-            // Concatenate: common header then per-kernel modules. The
-            // WGSL files reference struct names defined only in common.
             ceremony_src.clear();
             ceremony_src += common;
             ceremony_src += "\n";
@@ -182,14 +181,21 @@ struct Round {
     WGPUBuffer contributions_buf   = nullptr;
     WGPUBuffer state_buf           = nullptr;
     WGPUBuffer result_buf          = nullptr;
-    WGPUBuffer applied_counts_buf  = nullptr;  // 5 u32: cer, cnt, advances, finalized, failed
-    WGPUBuffer counter_init_buf    = nullptr;  // 4 u32: next_cont_lo/hi, next_share_lo/hi
+    WGPUBuffer applied_counts_buf  = nullptr;  // 5 u32 atomics: cer, cnt, advances, finalized, failed
+    WGPUBuffer counter_init_buf    = nullptr;  // 4 u32
 
-    // Readback staging for buffers we need to inspect.
+    // v0.62 leaf-fold scratch.
+    WGPUBuffer ceremony_leaves_buf      = nullptr;  // ceremony_count * 8 u32
+    WGPUBuffer share_leaves_buf         = nullptr;  // share_count * 8 u32
+    WGPUBuffer contribution_leaves_buf  = nullptr;  // contribution_count * 8 u32
+    WGPUBuffer ceremony_used_mask_buf   = nullptr;  // ceremony_count u32
+    WGPUBuffer share_used_mask_buf      = nullptr;  // share_count u32
+    WGPUBuffer contribution_used_mask_buf= nullptr; // contribution_count u32
+    WGPUBuffer count_outs_buf           = nullptr;  // 4 atomic u32: active, finalized, failed, share_count
+
     WGPUBuffer applied_counts_staging = nullptr;
     WGPUBuffer result_staging         = nullptr;
 
-    // Host staging for ops (one allocation per buffer; written via QueueWriteBuffer).
     std::vector<CeremonyOp>     ceremony_ops_host;
     std::vector<ContributionOp> contribution_ops_host;
 };
@@ -208,6 +214,13 @@ void release_round(Round& r) {
     rel(r.result_buf);
     rel(r.applied_counts_buf);
     rel(r.counter_init_buf);
+    rel(r.ceremony_leaves_buf);
+    rel(r.share_leaves_buf);
+    rel(r.contribution_leaves_buf);
+    rel(r.ceremony_used_mask_buf);
+    rel(r.share_used_mask_buf);
+    rel(r.contribution_used_mask_buf);
+    rel(r.count_outs_buf);
     rel(r.applied_counts_staging);
     rel(r.result_staging);
 }
@@ -215,12 +228,15 @@ void release_round(Round& r) {
 class MPCVMGPUEngineWgpu final : public MPCVMGPUEngine {
 public:
     MPCVMGPUEngineWgpu(WGPUInstance instance, WGPUAdapter adapter, WGPUDevice device,
-                       WGPUQueue queue, WGPUShaderModule mod_cer, WGPUShaderModule mod_tr,
-                       WGPUComputePipeline pso_cer, WGPUComputePipeline pso_tr,
+                       WGPUQueue queue,
+                       WGPUShaderModule mod_cer, WGPUShaderModule mod_tr,
+                       WGPUComputePipeline pso_apply, WGPUComputePipeline pso_sweep,
+                       WGPUComputePipeline pso_leaves, WGPUComputePipeline pso_compose,
                        std::string device_name)
         : instance_(instance), adapter_(adapter), device_(device), queue_(queue),
           mod_cer_(mod_cer), mod_tr_(mod_tr),
-          pso_cer_(pso_cer), pso_tr_(pso_tr),
+          pso_apply_(pso_apply), pso_sweep_(pso_sweep),
+          pso_leaves_(pso_leaves), pso_compose_(pso_compose),
           device_name_(std::move(device_name)) {}
 
     ~MPCVMGPUEngineWgpu() override {
@@ -229,8 +245,10 @@ public:
             release_round(round_);
             round_.handle = MPCVMRoundHandle{};
         }
-        if (pso_cer_) wgpuComputePipelineRelease(pso_cer_);
-        if (pso_tr_)  wgpuComputePipelineRelease(pso_tr_);
+        if (pso_apply_)   wgpuComputePipelineRelease(pso_apply_);
+        if (pso_sweep_)   wgpuComputePipelineRelease(pso_sweep_);
+        if (pso_leaves_)  wgpuComputePipelineRelease(pso_leaves_);
+        if (pso_compose_) wgpuComputePipelineRelease(pso_compose_);
         if (mod_cer_) wgpuShaderModuleRelease(mod_cer_);
         if (mod_tr_)  wgpuShaderModuleRelease(mod_tr_);
         if (queue_)   wgpuQueueRelease(queue_);
@@ -293,6 +311,28 @@ public:
                                               WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
                                               "mpcvm.counter_init");
 
+        round_.ceremony_leaves_buf      = mk_buf(sizeof(uint32_t) * 8 * kCeremonySlots,
+                                                  WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                                                  "mpcvm.cer_leaves");
+        round_.share_leaves_buf         = mk_buf(sizeof(uint32_t) * 8 * kKeyShareSlots,
+                                                  WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                                                  "mpcvm.shr_leaves");
+        round_.contribution_leaves_buf  = mk_buf(sizeof(uint32_t) * 8 * kContributionSlots,
+                                                  WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                                                  "mpcvm.cnt_leaves");
+        round_.ceremony_used_mask_buf   = mk_buf(sizeof(uint32_t) * kCeremonySlots,
+                                                  WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                                                  "mpcvm.cer_mask");
+        round_.share_used_mask_buf      = mk_buf(sizeof(uint32_t) * kKeyShareSlots,
+                                                  WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                                                  "mpcvm.shr_mask");
+        round_.contribution_used_mask_buf= mk_buf(sizeof(uint32_t) * kContributionSlots,
+                                                  WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                                                  "mpcvm.cnt_mask");
+        round_.count_outs_buf           = mk_buf(sizeof(uint32_t) * 4,
+                                                  WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                                                  "mpcvm.count_outs");
+
         round_.applied_counts_staging = mk_buf(sizeof(uint32_t) * 5,
                                                 WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst,
                                                 "mpcvm.applied.stg");
@@ -304,18 +344,26 @@ public:
             || !round_.ceremonies_buf || !round_.key_shares_buf || !round_.contributions_buf
             || !round_.state_buf || !round_.result_buf
             || !round_.applied_counts_buf || !round_.counter_init_buf
+            || !round_.ceremony_leaves_buf || !round_.share_leaves_buf
+            || !round_.contribution_leaves_buf
+            || !round_.ceremony_used_mask_buf || !round_.share_used_mask_buf
+            || !round_.contribution_used_mask_buf
+            || !round_.count_outs_buf
             || !round_.applied_counts_staging || !round_.result_staging) {
             release_round(round_);
             return MPCVMRoundHandle{0};
         }
 
-        // Zero-init all working buffers (Storage + CopyDst).
         zero_buffer(round_.ceremonies_buf,    sizeof(Ceremony) * kCeremonySlots);
         zero_buffer(round_.key_shares_buf,    sizeof(KeyShare) * kKeyShareSlots);
         zero_buffer(round_.contributions_buf, sizeof(Contribution) * kContributionSlots);
         zero_buffer(round_.state_buf,         sizeof(MPCVMState));
         zero_buffer(round_.result_buf,        sizeof(MPCVMTransitionResult));
         zero_buffer(round_.applied_counts_buf, sizeof(uint32_t) * 5);
+        zero_buffer(round_.ceremony_used_mask_buf,    sizeof(uint32_t) * kCeremonySlots);
+        zero_buffer(round_.share_used_mask_buf,       sizeof(uint32_t) * kKeyShareSlots);
+        zero_buffer(round_.contribution_used_mask_buf, sizeof(uint32_t) * kContributionSlots);
+        zero_buffer(round_.count_outs_buf,            sizeof(uint32_t) * 4);
 
         round_.ceremony_ops_host.reserve(kMaxOpsPerRound);
         round_.contribution_ops_host.reserve(kMaxOpsPerRound);
@@ -353,7 +401,6 @@ public:
         std::lock_guard<std::mutex> g(mu_);
         if (!check_handle(h)) return MPCVMTransitionResult{};
 
-        // Upload descriptor + op streams + counters.
         wgpuQueueWriteBuffer(queue_, round_.desc_buf, 0, &round_.desc, sizeof(round_.desc));
         if (round_.desc.ceremony_op_count > 0) {
             wgpuQueueWriteBuffer(queue_, round_.ceremony_ops_buf, 0,
@@ -373,41 +420,94 @@ public:
         };
         wgpuQueueWriteBuffer(queue_, round_.counter_init_buf, 0, counter_init, sizeof(counter_init));
 
+        // Bind group layouts come from the auto-layout PSOs.
+        WGPUBindGroupLayout layout_apply   = wgpuComputePipelineGetBindGroupLayout(pso_apply_, 0);
+        WGPUBindGroupLayout layout_sweep   = wgpuComputePipelineGetBindGroupLayout(pso_sweep_, 0);
+        WGPUBindGroupLayout layout_leaves  = wgpuComputePipelineGetBindGroupLayout(pso_leaves_, 0);
+        WGPUBindGroupLayout layout_compose = wgpuComputePipelineGetBindGroupLayout(pso_compose_, 0);
+
         // -- Bind groups --
-        WGPUBindGroupLayout layout_cer = wgpuComputePipelineGetBindGroupLayout(pso_cer_, 0);
-        WGPUBindGroupLayout layout_tr  = wgpuComputePipelineGetBindGroupLayout(pso_tr_, 0);
+        // ceremony_apply uses bindings 0..3, 5..7 (skips 4 = key_shares which
+        // it doesn't touch). The auto-derived layout for apply has 7 entries.
+        WGPUBindGroupEntry e_apply[7]{};
+        e_apply[0].binding = 0; e_apply[0].buffer = round_.desc_buf;             e_apply[0].size = sizeof(MPCVMRoundDescriptor);
+        e_apply[1].binding = 1; e_apply[1].buffer = round_.ceremony_ops_buf;     e_apply[1].size = sizeof(CeremonyOp) * kMaxOpsPerRound;
+        e_apply[2].binding = 2; e_apply[2].buffer = round_.contribution_ops_buf; e_apply[2].size = sizeof(ContributionOp) * kMaxOpsPerRound;
+        e_apply[3].binding = 3; e_apply[3].buffer = round_.ceremonies_buf;       e_apply[3].size = sizeof(Ceremony) * kCeremonySlots;
+        e_apply[4].binding = 5; e_apply[4].buffer = round_.contributions_buf;    e_apply[4].size = sizeof(Contribution) * kContributionSlots;
+        e_apply[5].binding = 6; e_apply[5].buffer = round_.applied_counts_buf;   e_apply[5].size = sizeof(uint32_t) * 5;
+        e_apply[6].binding = 7; e_apply[6].buffer = round_.counter_init_buf;     e_apply[6].size = sizeof(uint32_t) * 4;
+        WGPUBindGroupDescriptor bg_apply_d{};
+        bg_apply_d.label = mk_sv("mpcvm.bg.apply");
+        bg_apply_d.layout = layout_apply;
+        bg_apply_d.entryCount = 7;
+        bg_apply_d.entries = e_apply;
+        WGPUBindGroup bg_apply = wgpuDeviceCreateBindGroup(device_, &bg_apply_d);
 
-        WGPUBindGroupEntry e_cer[8]{};
-        e_cer[0].binding = 0; e_cer[0].buffer = round_.desc_buf;             e_cer[0].size = sizeof(MPCVMRoundDescriptor);
-        e_cer[1].binding = 1; e_cer[1].buffer = round_.ceremony_ops_buf;     e_cer[1].size = sizeof(CeremonyOp) * kMaxOpsPerRound;
-        e_cer[2].binding = 2; e_cer[2].buffer = round_.contribution_ops_buf; e_cer[2].size = sizeof(ContributionOp) * kMaxOpsPerRound;
-        e_cer[3].binding = 3; e_cer[3].buffer = round_.ceremonies_buf;       e_cer[3].size = sizeof(Ceremony) * kCeremonySlots;
-        e_cer[4].binding = 4; e_cer[4].buffer = round_.key_shares_buf;       e_cer[4].size = sizeof(KeyShare) * kKeyShareSlots;
-        e_cer[5].binding = 5; e_cer[5].buffer = round_.contributions_buf;    e_cer[5].size = sizeof(Contribution) * kContributionSlots;
-        e_cer[6].binding = 6; e_cer[6].buffer = round_.applied_counts_buf;   e_cer[6].size = sizeof(uint32_t) * 5;
-        e_cer[7].binding = 7; e_cer[7].buffer = round_.counter_init_buf;     e_cer[7].size = sizeof(uint32_t) * 4;
+        // ceremony_sweep uses bindings 0, 3, 4, 5, 6, 7 — skips ceremony_ops
+        // (1) and contribution_ops (2) which only the apply kernel reads.
+        WGPUBindGroup bg_sweep = nullptr;
+        {
+            WGPUBindGroupEntry e_sweep[6]{};
+            e_sweep[0].binding = 0; e_sweep[0].buffer = round_.desc_buf;          e_sweep[0].size = sizeof(MPCVMRoundDescriptor);
+            e_sweep[1].binding = 3; e_sweep[1].buffer = round_.ceremonies_buf;    e_sweep[1].size = sizeof(Ceremony) * kCeremonySlots;
+            e_sweep[2].binding = 4; e_sweep[2].buffer = round_.key_shares_buf;    e_sweep[2].size = sizeof(KeyShare) * kKeyShareSlots;
+            e_sweep[3].binding = 5; e_sweep[3].buffer = round_.contributions_buf; e_sweep[3].size = sizeof(Contribution) * kContributionSlots;
+            e_sweep[4].binding = 6; e_sweep[4].buffer = round_.applied_counts_buf; e_sweep[4].size = sizeof(uint32_t) * 5;
+            e_sweep[5].binding = 7; e_sweep[5].buffer = round_.counter_init_buf;  e_sweep[5].size = sizeof(uint32_t) * 4;
+            WGPUBindGroupDescriptor d{};
+            d.label = mk_sv("mpcvm.bg.sweep");
+            d.layout = layout_sweep;
+            d.entryCount = 6;
+            d.entries = e_sweep;
+            bg_sweep = wgpuDeviceCreateBindGroup(device_, &d);
+        }
 
-        WGPUBindGroupDescriptor bg_cer_d{};
-        bg_cer_d.label = mk_sv("mpcvm.bg.cer");
-        bg_cer_d.layout = layout_cer;
-        bg_cer_d.entryCount = 8;
-        bg_cer_d.entries = e_cer;
-        WGPUBindGroup bg_cer = wgpuDeviceCreateBindGroup(device_, &bg_cer_d);
+        // compute_leaves uses bindings 1..10 (ceremonies, shares,
+        // contributions, leaves x3, masks x3, count_outs).
+        WGPUBindGroupEntry e_leaves[10]{};
+        e_leaves[0].binding = 1;  e_leaves[0].buffer = round_.ceremonies_buf;    e_leaves[0].size = sizeof(Ceremony) * kCeremonySlots;
+        e_leaves[1].binding = 2;  e_leaves[1].buffer = round_.key_shares_buf;    e_leaves[1].size = sizeof(KeyShare) * kKeyShareSlots;
+        e_leaves[2].binding = 3;  e_leaves[2].buffer = round_.contributions_buf; e_leaves[2].size = sizeof(Contribution) * kContributionSlots;
+        e_leaves[3].binding = 4;  e_leaves[3].buffer = round_.ceremony_leaves_buf;     e_leaves[3].size = sizeof(uint32_t) * 8 * kCeremonySlots;
+        e_leaves[4].binding = 5;  e_leaves[4].buffer = round_.share_leaves_buf;        e_leaves[4].size = sizeof(uint32_t) * 8 * kKeyShareSlots;
+        e_leaves[5].binding = 6;  e_leaves[5].buffer = round_.contribution_leaves_buf; e_leaves[5].size = sizeof(uint32_t) * 8 * kContributionSlots;
+        e_leaves[6].binding = 7;  e_leaves[6].buffer = round_.ceremony_used_mask_buf;     e_leaves[6].size = sizeof(uint32_t) * kCeremonySlots;
+        e_leaves[7].binding = 8;  e_leaves[7].buffer = round_.share_used_mask_buf;        e_leaves[7].size = sizeof(uint32_t) * kKeyShareSlots;
+        e_leaves[8].binding = 9;  e_leaves[8].buffer = round_.contribution_used_mask_buf; e_leaves[8].size = sizeof(uint32_t) * kContributionSlots;
+        e_leaves[9].binding = 10; e_leaves[9].buffer = round_.count_outs_buf;            e_leaves[9].size = sizeof(uint32_t) * 4;
 
-        WGPUBindGroupEntry e_tr[6]{};
-        e_tr[0].binding = 0; e_tr[0].buffer = round_.desc_buf;          e_tr[0].size = sizeof(MPCVMRoundDescriptor);
-        e_tr[1].binding = 1; e_tr[1].buffer = round_.ceremonies_buf;    e_tr[1].size = sizeof(Ceremony) * kCeremonySlots;
-        e_tr[2].binding = 2; e_tr[2].buffer = round_.key_shares_buf;    e_tr[2].size = sizeof(KeyShare) * kKeyShareSlots;
-        e_tr[3].binding = 3; e_tr[3].buffer = round_.contributions_buf; e_tr[3].size = sizeof(Contribution) * kContributionSlots;
-        e_tr[4].binding = 4; e_tr[4].buffer = round_.state_buf;         e_tr[4].size = sizeof(MPCVMState);
-        e_tr[5].binding = 5; e_tr[5].buffer = round_.result_buf;        e_tr[5].size = sizeof(MPCVMTransitionResult);
+        WGPUBindGroupDescriptor bg_leaves_d{};
+        bg_leaves_d.label = mk_sv("mpcvm.bg.leaves");
+        bg_leaves_d.layout = layout_leaves;
+        bg_leaves_d.entryCount = 10;
+        bg_leaves_d.entries = e_leaves;
+        WGPUBindGroup bg_leaves = wgpuDeviceCreateBindGroup(device_, &bg_leaves_d);
 
-        WGPUBindGroupDescriptor bg_tr_d{};
-        bg_tr_d.label = mk_sv("mpcvm.bg.tr");
-        bg_tr_d.layout = layout_tr;
-        bg_tr_d.entryCount = 6;
-        bg_tr_d.entries = e_tr;
-        WGPUBindGroup bg_tr = wgpuDeviceCreateBindGroup(device_, &bg_tr_d);
+        // compose_root uses bindings 0 (desc), 4..10 (leaves+masks+counts),
+        // 11 (state), 12 (result). It also references ceremonies/shares/
+        // contributions for arrayLength so those are part of the auto-layout.
+        WGPUBindGroupEntry e_compose[13]{};
+        e_compose[0].binding = 0;  e_compose[0].buffer = round_.desc_buf;          e_compose[0].size = sizeof(MPCVMRoundDescriptor);
+        e_compose[1].binding = 1;  e_compose[1].buffer = round_.ceremonies_buf;    e_compose[1].size = sizeof(Ceremony) * kCeremonySlots;
+        e_compose[2].binding = 2;  e_compose[2].buffer = round_.key_shares_buf;    e_compose[2].size = sizeof(KeyShare) * kKeyShareSlots;
+        e_compose[3].binding = 3;  e_compose[3].buffer = round_.contributions_buf; e_compose[3].size = sizeof(Contribution) * kContributionSlots;
+        e_compose[4].binding = 4;  e_compose[4].buffer = round_.ceremony_leaves_buf;     e_compose[4].size = sizeof(uint32_t) * 8 * kCeremonySlots;
+        e_compose[5].binding = 5;  e_compose[5].buffer = round_.share_leaves_buf;        e_compose[5].size = sizeof(uint32_t) * 8 * kKeyShareSlots;
+        e_compose[6].binding = 6;  e_compose[6].buffer = round_.contribution_leaves_buf; e_compose[6].size = sizeof(uint32_t) * 8 * kContributionSlots;
+        e_compose[7].binding = 7;  e_compose[7].buffer = round_.ceremony_used_mask_buf;     e_compose[7].size = sizeof(uint32_t) * kCeremonySlots;
+        e_compose[8].binding = 8;  e_compose[8].buffer = round_.share_used_mask_buf;        e_compose[8].size = sizeof(uint32_t) * kKeyShareSlots;
+        e_compose[9].binding = 9;  e_compose[9].buffer = round_.contribution_used_mask_buf; e_compose[9].size = sizeof(uint32_t) * kContributionSlots;
+        e_compose[10].binding = 10; e_compose[10].buffer = round_.count_outs_buf;            e_compose[10].size = sizeof(uint32_t) * 4;
+        e_compose[11].binding = 11; e_compose[11].buffer = round_.state_buf;                 e_compose[11].size = sizeof(MPCVMState);
+        e_compose[12].binding = 12; e_compose[12].buffer = round_.result_buf;                e_compose[12].size = sizeof(MPCVMTransitionResult);
+
+        WGPUBindGroupDescriptor bg_compose_d{};
+        bg_compose_d.label = mk_sv("mpcvm.bg.compose");
+        bg_compose_d.layout = layout_compose;
+        bg_compose_d.entryCount = 13;
+        bg_compose_d.entries = e_compose;
+        WGPUBindGroup bg_compose = wgpuDeviceCreateBindGroup(device_, &bg_compose_d);
 
         // -- Encode dispatches --
         WGPUCommandEncoderDescriptor enc_d{};
@@ -416,26 +516,49 @@ public:
 
         {
             WGPUComputePassDescriptor pd{};
-            pd.label = mk_sv("mpcvm.cer.pass");
+            pd.label = mk_sv("mpcvm.apply.pass");
             WGPUComputePassEncoder p = wgpuCommandEncoderBeginComputePass(enc, &pd);
-            wgpuComputePassEncoderSetPipeline(p, pso_cer_);
-            wgpuComputePassEncoderSetBindGroup(p, 0, bg_cer, 0, nullptr);
+            wgpuComputePassEncoderSetPipeline(p, pso_apply_);
+            wgpuComputePassEncoderSetBindGroup(p, 0, bg_apply, 0, nullptr);
             wgpuComputePassEncoderDispatchWorkgroups(p, 1, 1, 1);
             wgpuComputePassEncoderEnd(p);
             wgpuComputePassEncoderRelease(p);
         }
         {
             WGPUComputePassDescriptor pd{};
-            pd.label = mk_sv("mpcvm.tr.pass");
+            pd.label = mk_sv("mpcvm.sweep.pass");
             WGPUComputePassEncoder p = wgpuCommandEncoderBeginComputePass(enc, &pd);
-            wgpuComputePassEncoderSetPipeline(p, pso_tr_);
-            wgpuComputePassEncoderSetBindGroup(p, 0, bg_tr, 0, nullptr);
+            wgpuComputePassEncoderSetPipeline(p, pso_sweep_);
+            wgpuComputePassEncoderSetBindGroup(p, 0, bg_sweep, 0, nullptr);
+            // workgroup_size(256) == kSweepThreads; one workgroup covers all
+            // ceremony slots.
+            wgpuComputePassEncoderDispatchWorkgroups(p, 1, 1, 1);
+            wgpuComputePassEncoderEnd(p);
+            wgpuComputePassEncoderRelease(p);
+        }
+        {
+            WGPUComputePassDescriptor pd{};
+            pd.label = mk_sv("mpcvm.leaves.pass");
+            WGPUComputePassEncoder p = wgpuCommandEncoderBeginComputePass(enc, &pd);
+            wgpuComputePassEncoderSetPipeline(p, pso_leaves_);
+            wgpuComputePassEncoderSetBindGroup(p, 0, bg_leaves, 0, nullptr);
+            // workgroup_size(64) — dispatch ceil(kLeafThreads / 64) workgroups.
+            uint32_t groups = (kLeafThreads + 63u) / 64u;
+            wgpuComputePassEncoderDispatchWorkgroups(p, groups, 1, 1);
+            wgpuComputePassEncoderEnd(p);
+            wgpuComputePassEncoderRelease(p);
+        }
+        {
+            WGPUComputePassDescriptor pd{};
+            pd.label = mk_sv("mpcvm.compose.pass");
+            WGPUComputePassEncoder p = wgpuCommandEncoderBeginComputePass(enc, &pd);
+            wgpuComputePassEncoderSetPipeline(p, pso_compose_);
+            wgpuComputePassEncoderSetBindGroup(p, 0, bg_compose, 0, nullptr);
             wgpuComputePassEncoderDispatchWorkgroups(p, 1, 1, 1);
             wgpuComputePassEncoderEnd(p);
             wgpuComputePassEncoderRelease(p);
         }
 
-        // Copy result + applied_counts to staging buffers for readback.
         wgpuCommandEncoderCopyBufferToBuffer(enc, round_.applied_counts_buf, 0,
                                               round_.applied_counts_staging, 0,
                                               sizeof(uint32_t) * 5);
@@ -449,15 +572,17 @@ public:
         wgpuQueueSubmit(queue_, 1, &cmd);
         wgpuCommandBufferRelease(cmd);
         wgpuCommandEncoderRelease(enc);
-        wgpuBindGroupRelease(bg_cer);
-        wgpuBindGroupRelease(bg_tr);
-        wgpuBindGroupLayoutRelease(layout_cer);
-        wgpuBindGroupLayoutRelease(layout_tr);
+        wgpuBindGroupRelease(bg_apply);
+        wgpuBindGroupRelease(bg_sweep);
+        wgpuBindGroupRelease(bg_leaves);
+        wgpuBindGroupRelease(bg_compose);
+        wgpuBindGroupLayoutRelease(layout_apply);
+        wgpuBindGroupLayoutRelease(layout_sweep);
+        wgpuBindGroupLayoutRelease(layout_leaves);
+        wgpuBindGroupLayoutRelease(layout_compose);
 
-        // Drain async queue work — wgpu-native equivalent of Dawn device.Tick().
         wgpuDevicePoll(device_, /*wait=*/true, nullptr);
 
-        // Map applied counts and result.
         uint32_t applied[5]{};
         if (!read_buffer(round_.applied_counts_staging, applied, sizeof(applied))) {
             std::fprintf(stderr, "mpcvm wgpu: applied_counts readback failed\n");
@@ -469,27 +594,19 @@ public:
             return MPCVMTransitionResult{};
         }
 
-        // The shader fills root fields + counts. The applied/advance/finalized/failed
-        // counts come back via the dedicated buffer.
         result.ceremony_apply_count    = applied[0];
         result.contribution_apply_count = applied[1];
         result.round_advance_count      = applied[2];
         result.finalized_this_round     = applied[3];
         result.failed_this_round        = applied[4];
 
-        // Bump host-side counters by what the shader applied.
         round_.next_contribution_id += applied[1];
-        // share IDs: shader writes share_id into the table; host id is monotonic
-        // and not strictly continuous within a session — same contract as Metal.
-
         return result;
     }
 
     MPCVMTransitionResult poll_round_result(MPCVMRoundHandle h) const override {
         std::lock_guard<std::mutex> g(mu_);
         if (!check_handle_const(h)) return MPCVMTransitionResult{};
-        // We don't keep a cached result; re-read via run_until_done is the
-        // path. For symmetry with Metal, return a zero result here.
         return MPCVMTransitionResult{};
     }
 
@@ -507,7 +624,6 @@ private:
     bool check_handle_const(MPCVMRoundHandle h) const { return check_handle(h); }
 
     void zero_buffer(WGPUBuffer buf, size_t size) {
-        // Host-side zero buffer; uploaded once per round init.
         std::vector<uint8_t> zeros(size, 0);
         wgpuQueueWriteBuffer(queue_, buf, 0, zeros.data(), zeros.size());
     }
@@ -519,7 +635,6 @@ private:
         cbinfo.callback = on_map;
         cbinfo.userdata1 = &await;
         wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, size, cbinfo);
-        // Poll until the map callback fires.
         while (!await.done) {
             wgpuDevicePoll(device_, /*wait=*/true, nullptr);
         }
@@ -537,8 +652,10 @@ private:
     WGPUQueue    queue_;
     WGPUShaderModule mod_cer_;
     WGPUShaderModule mod_tr_;
-    WGPUComputePipeline pso_cer_;
-    WGPUComputePipeline pso_tr_;
+    WGPUComputePipeline pso_apply_;
+    WGPUComputePipeline pso_sweep_;
+    WGPUComputePipeline pso_leaves_;
+    WGPUComputePipeline pso_compose_;
     std::string device_name_;
 
     Round round_;
@@ -548,12 +665,7 @@ private:
 
 }  // namespace
 
-// The wgpu-native engine factory. Always available (under
-// LUX_MPCVM_ENABLE_WGPU) regardless of Metal/CUDA presence — that lets
-// the determinism harness exercise WGSL alongside the platform-canonical
-// driver for true 4-way comparison.
 std::unique_ptr<MPCVMGPUEngine> create_mpcvm_wgpu_engine() {
-    // 1. Instance.
     WGPUInstanceDescriptor idesc{};
     WGPUInstance instance = wgpuCreateInstance(&idesc);
     if (!instance) {
@@ -561,7 +673,6 @@ std::unique_ptr<MPCVMGPUEngine> create_mpcvm_wgpu_engine() {
         return nullptr;
     }
 
-    // 2. Adapter (sync via spin).
     AdapterAwait aw{};
     WGPURequestAdapterOptions ropt{};
     WGPURequestAdapterCallbackInfo cb{};
@@ -578,9 +689,14 @@ std::unique_ptr<MPCVMGPUEngine> create_mpcvm_wgpu_engine() {
         return nullptr;
     }
 
-    // 3. Device (sync via spin).
+    // Adapter's reported limits — request as much as the adapter supports
+    // so the leaves+compose binding group (10 storage buffers) fits.
+    WGPULimits adapter_limits{};
+    wgpuAdapterGetLimits(aw.adapter, &adapter_limits);
+
     DeviceAwait dw{};
     WGPUDeviceDescriptor ddesc{};
+    ddesc.requiredLimits = &adapter_limits;
     WGPURequestDeviceCallbackInfo dcb{};
     dcb.mode = WGPUCallbackMode_AllowProcessEvents;
     dcb.callback = on_device;
@@ -605,7 +721,6 @@ std::unique_ptr<MPCVMGPUEngine> create_mpcvm_wgpu_engine() {
         return nullptr;
     }
 
-    // 4. WGSL sources.
     std::string ceremony_src, transition_src;
     if (!load_wgsl_sources(ceremony_src, transition_src)) {
         std::fprintf(stderr, "mpcvm wgpu: WGSL sources not found near %s\n", __FILE__);
@@ -629,14 +744,20 @@ std::unique_ptr<MPCVMGPUEngine> create_mpcvm_wgpu_engine() {
         return nullptr;
     }
 
-    WGPUComputePipeline pso_cer = create_compute_pipeline(dw.device, mod_cer,
-                                                           "mpcvm_ceremony_step", "mpcvm.cer.pso");
-    WGPUComputePipeline pso_tr  = create_compute_pipeline(dw.device, mod_tr,
-                                                           "mpcvm_transition", "mpcvm.tr.pso");
-    if (!pso_cer || !pso_tr) {
+    WGPUComputePipeline pso_apply   = create_compute_pipeline(dw.device, mod_cer,
+                                                                "mpcvm_ceremony_apply", "mpcvm.apply.pso");
+    WGPUComputePipeline pso_sweep   = create_compute_pipeline(dw.device, mod_cer,
+                                                                "mpcvm_ceremony_sweep", "mpcvm.sweep.pso");
+    WGPUComputePipeline pso_leaves  = create_compute_pipeline(dw.device, mod_tr,
+                                                                "mpcvm_compute_leaves", "mpcvm.leaves.pso");
+    WGPUComputePipeline pso_compose = create_compute_pipeline(dw.device, mod_tr,
+                                                                "mpcvm_compose_root", "mpcvm.compose.pso");
+    if (!pso_apply || !pso_sweep || !pso_leaves || !pso_compose) {
         std::fprintf(stderr, "mpcvm wgpu: compute pipeline create failed\n");
-        if (pso_cer) wgpuComputePipelineRelease(pso_cer);
-        if (pso_tr)  wgpuComputePipelineRelease(pso_tr);
+        if (pso_apply)   wgpuComputePipelineRelease(pso_apply);
+        if (pso_sweep)   wgpuComputePipelineRelease(pso_sweep);
+        if (pso_leaves)  wgpuComputePipelineRelease(pso_leaves);
+        if (pso_compose) wgpuComputePipelineRelease(pso_compose);
         wgpuShaderModuleRelease(mod_cer);
         wgpuShaderModuleRelease(mod_tr);
         wgpuQueueRelease(queue);
@@ -646,7 +767,6 @@ std::unique_ptr<MPCVMGPUEngine> create_mpcvm_wgpu_engine() {
         return nullptr;
     }
 
-    // Adapter info (best-effort device name).
     std::string name = "wgpu-native";
     WGPUAdapterInfo info{};
     if (wgpuAdapterGetInfo(aw.adapter, &info) == WGPUStatus_Success) {
@@ -658,12 +778,11 @@ std::unique_ptr<MPCVMGPUEngine> create_mpcvm_wgpu_engine() {
 
     return std::unique_ptr<MPCVMGPUEngine>(
         new MPCVMGPUEngineWgpu(instance, aw.adapter, dw.device, queue,
-                                mod_cer, mod_tr, pso_cer, pso_tr, name));
+                                mod_cer, mod_tr,
+                                pso_apply, pso_sweep, pso_leaves, pso_compose,
+                                name));
 }
 
-// On non-Metal / non-CUDA platforms the wgpu engine is the canonical
-// MPCVMGPUEngine::create() path. On Apple/Linux+CUDA it's a sibling
-// factory used by the test harness for cross-backend equivalence.
 #if !defined(__APPLE__) && !defined(LUX_MPCVM_HAVE_CUDA)
 std::unique_ptr<MPCVMGPUEngine> MPCVMGPUEngine::create() {
     return create_mpcvm_wgpu_engine();
@@ -672,9 +791,6 @@ std::unique_ptr<MPCVMGPUEngine> MPCVMGPUEngine::create() {
 
 #else  // !LUX_MPCVM_ENABLE_WGPU
 
-// Without wgpu-native linked, this TU still provides a no-op factory hook
-// (weak on Apple/CUDA so the canonical platform driver wins; strong
-// otherwise so the linker has a definition for tests).
 #if !defined(__APPLE__) && !defined(LUX_MPCVM_HAVE_CUDA)
 std::unique_ptr<MPCVMGPUEngine> MPCVMGPUEngine::create() {
     return nullptr;

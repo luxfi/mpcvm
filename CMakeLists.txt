@@ -9,7 +9,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(lux-mpcvm
-    VERSION 0.61.1
+    VERSION 0.62
     DESCRIPTION "GPU-native M-Chain (MPC) ceremony substrate"
     LANGUAGES CXX
 )

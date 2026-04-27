@@ -1,98 +1,203 @@
 // Copyright (C) 2026, Lux Partners Limited. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// mpcvm_transition.wgsl — root composition kernel for the wgpu/Dawn backend.
+// mpcvm_transition.wgsl — v0.62 parallel leaf hashing + serial fold (WGSL).
 //
-// Composes ceremony_root, key_share_root, contribution_root, and
-// mpcvm_state_root from the on-device arenas using the in-shader keccak
-// from mpcvm_kernels_common.wgsl. Byte-for-byte equivalent to the Metal
-// and CUDA peers.
+// Two compute entry points (mirror of Metal split):
+//   1. mpcvm_compute_leaves  — workgroup_size(64), per-slot keccak.
+//      Each thread hashes one occupied leaf into the leaf_hashes array.
+//   2. mpcvm_compose_root    — workgroup_size(1), serial fold + state-root
+//      composition.
+//
+// Determinism: leaves computed independently; fold consumed in canonical
+// slot order. Byte-equal to v0.61.1 single-thread implementation.
 
 @group(0) @binding(0) var<storage, read>       desc:           MPCVMRoundDescriptor;
-@group(0) @binding(1) var<storage, read_write> ceremonies:     array<Ceremony>;
-@group(0) @binding(2) var<storage, read_write> shares:         array<KeyShare>;
-@group(0) @binding(3) var<storage, read_write> contributions:  array<Contribution>;
-@group(0) @binding(4) var<storage, read_write> state:          MPCVMState;
-@group(0) @binding(5) var<storage, read_write> result:         MPCVMTransitionResult;
+@group(0) @binding(1) var<storage, read>       ceremonies:     array<Ceremony>;
+@group(0) @binding(2) var<storage, read>       shares:         array<KeyShare>;
+@group(0) @binding(3) var<storage, read>       contributions:  array<Contribution>;
+@group(0) @binding(4) var<storage, read_write> ceremony_leaves:    array<u32>;
+@group(0) @binding(5) var<storage, read_write> share_leaves:       array<u32>;
+@group(0) @binding(6) var<storage, read_write> contribution_leaves: array<u32>;
+@group(0) @binding(7) var<storage, read_write> ceremony_used_mask: array<u32>;
+@group(0) @binding(8) var<storage, read_write> share_used_mask:    array<u32>;
+@group(0) @binding(9) var<storage, read_write> contribution_used_mask: array<u32>;
+@group(0) @binding(10) var<storage, read_write> count_outs: array<atomic<u32>, 4>;  // active, finalized, failed, share_count
+@group(0) @binding(11) var<storage, read_write> state:          MPCVMState;
+@group(0) @binding(12) var<storage, read_write> result:         MPCVMTransitionResult;
 
-// Read byte k from a packed array<u32, 8> field (32 bytes).
-// In the WGSL Ceremony struct, subject[8]/ceremony_seed[8] are u32 lanes
-// holding 4 packed bytes each in little-endian.
-fn read_packed_byte(field: ptr<function, array<u32, 8>>, k: u32) -> u32 {
-    let lane: u32 = k / 4u;
-    let sh: u32   = (k % 4u) * 8u;
-    return ((*field)[lane] >> sh) & 0xFFu;
+// Pack 32 bytes (held in 32 u32 lane bytes) into 8 u32 lanes.
+fn pack_hash(src: ptr<function, array<u32, 32>>, lane_idx: u32) -> u32 {
+    return ((*src)[lane_idx * 4u + 0u]      )
+         | ((*src)[lane_idx * 4u + 1u] <<  8u)
+         | ((*src)[lane_idx * 4u + 2u] << 16u)
+         | ((*src)[lane_idx * 4u + 3u] << 24u);
 }
 
-fn write_byte_to_buf(buf: ptr<function, array<u32, 2048>>, off: u32, b: u32) {
-    (*buf)[off] = b & 0xFFu;
-}
+// =============================================================================
+// Pass 1: parallel leaf hash computation.
+// =============================================================================
 
-@compute @workgroup_size(1)
-fn mpcvm_transition(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x != 0u) { return; }
+@compute @workgroup_size(64)
+fn mpcvm_compute_leaves(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid = gid.x;
+    let n_cer = arrayLength(&ceremonies);
+    let n_share = arrayLength(&shares);
+    let n_cont = arrayLength(&contributions);
 
     var leaf_buf: array<u32, 2048>;
+    var leaf_hash: array<u32, 32>;
+
+    // -- ceremony leaf --
+    if (tid < n_cer) {
+        let st = ceremonies[tid].status;
+        if (st == kCeremonyStatusFree) {
+            ceremony_used_mask[tid] = 0u;
+        } else {
+            ceremony_used_mask[tid] = 1u;
+            if (st == kCeremonyStatusInProgress) { atomicAdd(&count_outs[0], 1u); }
+            if (st == kCeremonyStatusFinalized)  { atomicAdd(&count_outs[1], 1u); }
+            if (st == kCeremonyStatusFailed)     { atomicAdd(&count_outs[2], 1u); }
+
+            var o: u32 = 0u;
+            write_u64_le(&leaf_buf, o, ceremonies[tid].ceremony_id_lo, ceremonies[tid].ceremony_id_hi); o = o + 8u;
+            write_u64_le(&leaf_buf, o, ceremonies[tid].started_at_ns_lo, ceremonies[tid].started_at_ns_hi); o = o + 8u;
+            write_u64_le(&leaf_buf, o, ceremonies[tid].deadline_ns_lo, ceremonies[tid].deadline_ns_hi); o = o + 8u;
+            write_u64_le(&leaf_buf, o, ceremonies[tid].participants_bitmap_lo, ceremonies[tid].participants_bitmap_hi); o = o + 8u;
+            write_u32_le(&leaf_buf, o, ceremonies[tid].kind);                  o = o + 4u;
+            write_u32_le(&leaf_buf, o, ceremonies[tid].round);                 o = o + 4u;
+            write_u32_le(&leaf_buf, o, ceremonies[tid].threshold);             o = o + 4u;
+            write_u32_le(&leaf_buf, o, ceremonies[tid].total_participants);    o = o + 4u;
+            write_u32_le(&leaf_buf, o, ceremonies[tid].status);                o = o + 4u;
+            write_u32_le(&leaf_buf, o, ceremonies[tid].contribution_count);    o = o + 4u;
+            for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+                let v = ceremonies[tid].subject[k];
+                leaf_buf[o + 0u] = v & 0xFFu;
+                leaf_buf[o + 1u] = (v >> 8u) & 0xFFu;
+                leaf_buf[o + 2u] = (v >> 16u) & 0xFFu;
+                leaf_buf[o + 3u] = (v >> 24u) & 0xFFu;
+                o = o + 4u;
+            }
+            for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+                let v = ceremonies[tid].ceremony_seed[k];
+                leaf_buf[o + 0u] = v & 0xFFu;
+                leaf_buf[o + 1u] = (v >> 8u) & 0xFFu;
+                leaf_buf[o + 2u] = (v >> 16u) & 0xFFu;
+                leaf_buf[o + 3u] = (v >> 24u) & 0xFFu;
+                o = o + 4u;
+            }
+            write_u32_le(&leaf_buf, o, tid); o = o + 4u;
+
+            keccak256_buf2048(&leaf_buf, o, &leaf_hash);
+            for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+                ceremony_leaves[tid * 8u + k] = pack_hash(&leaf_hash, k);
+            }
+        }
+    }
+
+    // -- key share leaf --
+    if (tid < n_share) {
+        if (shares[tid].occupied == 0u) {
+            share_used_mask[tid] = 0u;
+        } else {
+            share_used_mask[tid] = 1u;
+            atomicAdd(&count_outs[3], 1u);
+
+            var o: u32 = 0u;
+            write_u64_le(&leaf_buf, o, shares[tid].share_id_lo,    shares[tid].share_id_hi);    o = o + 8u;
+            write_u64_le(&leaf_buf, o, shares[tid].ceremony_id_lo, shares[tid].ceremony_id_hi); o = o + 8u;
+            write_u64_le(&leaf_buf, o, shares[tid].holder_addr_lo, shares[tid].holder_addr_hi); o = o + 8u;
+            write_u32_le(&leaf_buf, o, shares[tid].scheme);          o = o + 4u;
+            write_u32_le(&leaf_buf, o, shares[tid].holder_index);    o = o + 4u;
+            let sd_len = shares[tid].share_data_len;
+            write_u32_le(&leaf_buf, o, sd_len);                    o = o + 4u;
+            var written: u32 = 0u;
+            for (var lane: u32 = 0u; lane < 80u; lane = lane + 1u) {
+                if (written >= sd_len) { break; }
+                let v = shares[tid].share_data[lane];
+                let take: u32 = min(4u, sd_len - written);
+                for (var b: u32 = 0u; b < take; b = b + 1u) {
+                    leaf_buf[o + b] = (v >> (b * 8u)) & 0xFFu;
+                }
+                o = o + take;
+                written = written + take;
+            }
+            write_u32_le(&leaf_buf, o, tid); o = o + 4u;
+
+            keccak256_buf2048(&leaf_buf, o, &leaf_hash);
+            for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+                share_leaves[tid * 8u + k] = pack_hash(&leaf_hash, k);
+            }
+        }
+    }
+
+    // -- contribution leaf --
+    if (tid < n_cont) {
+        if (contributions[tid].status != 1u) {
+            contribution_used_mask[tid] = 0u;
+        } else {
+            contribution_used_mask[tid] = 1u;
+
+            var o: u32 = 0u;
+            write_u64_le(&leaf_buf, o, contributions[tid].contribution_id_lo, contributions[tid].contribution_id_hi); o = o + 8u;
+            write_u64_le(&leaf_buf, o, contributions[tid].ceremony_id_lo,     contributions[tid].ceremony_id_hi);     o = o + 8u;
+            write_u64_le(&leaf_buf, o, contributions[tid].holder_addr_lo,     contributions[tid].holder_addr_hi);     o = o + 8u;
+            write_u32_le(&leaf_buf, o, contributions[tid].round);          o = o + 4u;
+            write_u32_le(&leaf_buf, o, contributions[tid].holder_index);   o = o + 4u;
+            let plen = contributions[tid].payload_len;
+            write_u32_le(&leaf_buf, o, plen);                            o = o + 4u;
+            var written: u32 = 0u;
+            for (var lane: u32 = 0u; lane < 96u; lane = lane + 1u) {
+                if (written >= plen) { break; }
+                let v = contributions[tid].payload[lane];
+                let take: u32 = min(4u, plen - written);
+                for (var b: u32 = 0u; b < take; b = b + 1u) {
+                    leaf_buf[o + b] = (v >> (b * 8u)) & 0xFFu;
+                }
+                o = o + take;
+                written = written + take;
+            }
+            write_u32_le(&leaf_buf, o, tid); o = o + 4u;
+
+            keccak256_buf2048(&leaf_buf, o, &leaf_hash);
+            for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+                contribution_leaves[tid * 8u + k] = pack_hash(&leaf_hash, k);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Pass 2: serial fold + state-root composition (workgroup_size(1)).
+// =============================================================================
+
+@compute @workgroup_size(1)
+fn mpcvm_compose_root(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x != 0u) { return; }
+
     var fold_buf: array<u32, 64>;
+    var leaf_buf: array<u32, 2048>;
     var leaf_hash: array<u32, 32>;
     var acc: array<u32, 32>;
 
-    // Zero acc.
-    for (var k: u32 = 0u; k < 32u; k = k + 1u) { acc[k] = 0u; }
-
-    // -- ceremony root + counts --
-    var n_active: u32 = 0u;
-    var finalized: u32 = 0u;
-    var failed: u32 = 0u;
     let n_cer = arrayLength(&ceremonies);
+    let n_share = arrayLength(&shares);
+    let n_cont = arrayLength(&contributions);
 
+    // -- ceremony root fold --
+    for (var k: u32 = 0u; k < 32u; k = k + 1u) { acc[k] = 0u; }
     for (var i: u32 = 0u; i < n_cer; i = i + 1u) {
-        let st = ceremonies[i].status;
-        if (st == kCeremonyStatusFree) { continue; }
-        if (st == kCeremonyStatusInProgress) { n_active = n_active + 1u; }
-        if (st == kCeremonyStatusFinalized)  { finalized = finalized + 1u; }
-        if (st == kCeremonyStatusFailed)     { failed = failed + 1u; }
-
-        // leaf = ceremony_id (8) || started (8) || deadline (8) || bitmap (8) ||
-        //        kind (4) || round (4) || threshold (4) || total (4) ||
-        //        status (4) || cont_count (4) || subject (32) || seed (32) || index (4)
-        var o: u32 = 0u;
-        write_u64_le(&leaf_buf, o, ceremonies[i].ceremony_id_lo, ceremonies[i].ceremony_id_hi); o = o + 8u;
-        write_u64_le(&leaf_buf, o, ceremonies[i].started_at_ns_lo, ceremonies[i].started_at_ns_hi); o = o + 8u;
-        write_u64_le(&leaf_buf, o, ceremonies[i].deadline_ns_lo, ceremonies[i].deadline_ns_hi); o = o + 8u;
-        write_u64_le(&leaf_buf, o, ceremonies[i].participants_bitmap_lo, ceremonies[i].participants_bitmap_hi); o = o + 8u;
-        write_u32_le(&leaf_buf, o, ceremonies[i].kind);                  o = o + 4u;
-        write_u32_le(&leaf_buf, o, ceremonies[i].round);                 o = o + 4u;
-        write_u32_le(&leaf_buf, o, ceremonies[i].threshold);             o = o + 4u;
-        write_u32_le(&leaf_buf, o, ceremonies[i].total_participants);    o = o + 4u;
-        write_u32_le(&leaf_buf, o, ceremonies[i].status);                o = o + 4u;
-        write_u32_le(&leaf_buf, o, ceremonies[i].contribution_count);    o = o + 4u;
-        // subject (32 bytes packed in 8 u32 lanes)
+        if (ceremony_used_mask[i] == 0u) { continue; }
+        for (var k: u32 = 0u; k < 32u; k = k + 1u) { fold_buf[k] = acc[k]; }
         for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-            let v = ceremonies[i].subject[k];
-            leaf_buf[o + 0u] = v & 0xFFu;
-            leaf_buf[o + 1u] = (v >> 8u) & 0xFFu;
-            leaf_buf[o + 2u] = (v >> 16u) & 0xFFu;
-            leaf_buf[o + 3u] = (v >> 24u) & 0xFFu;
-            o = o + 4u;
+            let v = ceremony_leaves[i * 8u + k];
+            fold_buf[32u + k * 4u + 0u] = v & 0xFFu;
+            fold_buf[32u + k * 4u + 1u] = (v >> 8u) & 0xFFu;
+            fold_buf[32u + k * 4u + 2u] = (v >> 16u) & 0xFFu;
+            fold_buf[32u + k * 4u + 3u] = (v >> 24u) & 0xFFu;
         }
-        for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-            let v = ceremonies[i].ceremony_seed[k];
-            leaf_buf[o + 0u] = v & 0xFFu;
-            leaf_buf[o + 1u] = (v >> 8u) & 0xFFu;
-            leaf_buf[o + 2u] = (v >> 16u) & 0xFFu;
-            leaf_buf[o + 3u] = (v >> 24u) & 0xFFu;
-            o = o + 4u;
-        }
-        write_u32_le(&leaf_buf, o, i); o = o + 4u;
-
-        keccak256_buf2048(&leaf_buf, o, &leaf_hash);
-        // fold: acc = keccak(acc || leaf_hash)
-        for (var k: u32 = 0u; k < 32u; k = k + 1u) { fold_buf[k]      = acc[k]; }
-        for (var k: u32 = 0u; k < 32u; k = k + 1u) { fold_buf[32u + k] = leaf_hash[k]; }
         keccak256_buf64(&fold_buf, &acc);
     }
-    // copy ceremony_root acc into state.
     for (var k: u32 = 0u; k < 8u; k = k + 1u) {
         state.ceremony_root[k] =
             (acc[k * 4u + 0u]      ) |
@@ -101,40 +206,18 @@ fn mpcvm_transition(@builtin(global_invocation_id) gid: vec3<u32>) {
             (acc[k * 4u + 3u] << 24u);
     }
 
-    // -- key_share root + count --
+    // -- key share root fold --
     for (var k: u32 = 0u; k < 32u; k = k + 1u) { acc[k] = 0u; }
-    var shares_n: u32 = 0u;
-    let n_share = arrayLength(&shares);
     for (var i: u32 = 0u; i < n_share; i = i + 1u) {
-        if (shares[i].occupied == 0u) { continue; }
-        shares_n = shares_n + 1u;
-
-        var o: u32 = 0u;
-        write_u64_le(&leaf_buf, o, shares[i].share_id_lo,    shares[i].share_id_hi);    o = o + 8u;
-        write_u64_le(&leaf_buf, o, shares[i].ceremony_id_lo, shares[i].ceremony_id_hi); o = o + 8u;
-        write_u64_le(&leaf_buf, o, shares[i].holder_addr_lo, shares[i].holder_addr_hi); o = o + 8u;
-        write_u32_le(&leaf_buf, o, shares[i].scheme);          o = o + 4u;
-        write_u32_le(&leaf_buf, o, shares[i].holder_index);    o = o + 4u;
-        let sd_len = shares[i].share_data_len;
-        write_u32_le(&leaf_buf, o, sd_len);                    o = o + 4u;
-        // share_data: stored as u32 lanes (4 bytes each, 80 lanes = 320 bytes).
-        // sd_len <= 320 always (Frost/CGGMP21 = 65, Ringtail = 256).
-        var written: u32 = 0u;
-        for (var lane: u32 = 0u; lane < 80u; lane = lane + 1u) {
-            if (written >= sd_len) { break; }
-            let v = shares[i].share_data[lane];
-            let take: u32 = min(4u, sd_len - written);
-            for (var b: u32 = 0u; b < take; b = b + 1u) {
-                leaf_buf[o + b] = (v >> (b * 8u)) & 0xFFu;
-            }
-            o = o + take;
-            written = written + take;
+        if (share_used_mask[i] == 0u) { continue; }
+        for (var k: u32 = 0u; k < 32u; k = k + 1u) { fold_buf[k] = acc[k]; }
+        for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+            let v = share_leaves[i * 8u + k];
+            fold_buf[32u + k * 4u + 0u] = v & 0xFFu;
+            fold_buf[32u + k * 4u + 1u] = (v >> 8u) & 0xFFu;
+            fold_buf[32u + k * 4u + 2u] = (v >> 16u) & 0xFFu;
+            fold_buf[32u + k * 4u + 3u] = (v >> 24u) & 0xFFu;
         }
-        write_u32_le(&leaf_buf, o, i); o = o + 4u;
-
-        keccak256_buf2048(&leaf_buf, o, &leaf_hash);
-        for (var k: u32 = 0u; k < 32u; k = k + 1u) { fold_buf[k]      = acc[k]; }
-        for (var k: u32 = 0u; k < 32u; k = k + 1u) { fold_buf[32u + k] = leaf_hash[k]; }
         keccak256_buf64(&fold_buf, &acc);
     }
     for (var k: u32 = 0u; k < 8u; k = k + 1u) {
@@ -145,35 +228,18 @@ fn mpcvm_transition(@builtin(global_invocation_id) gid: vec3<u32>) {
             (acc[k * 4u + 3u] << 24u);
     }
 
-    // -- contribution root --
+    // -- contribution root fold --
     for (var k: u32 = 0u; k < 32u; k = k + 1u) { acc[k] = 0u; }
-    let n_cont = arrayLength(&contributions);
     for (var i: u32 = 0u; i < n_cont; i = i + 1u) {
-        if (contributions[i].status != 1u) { continue; }
-        var o: u32 = 0u;
-        write_u64_le(&leaf_buf, o, contributions[i].contribution_id_lo, contributions[i].contribution_id_hi); o = o + 8u;
-        write_u64_le(&leaf_buf, o, contributions[i].ceremony_id_lo,     contributions[i].ceremony_id_hi);     o = o + 8u;
-        write_u64_le(&leaf_buf, o, contributions[i].holder_addr_lo,     contributions[i].holder_addr_hi);     o = o + 8u;
-        write_u32_le(&leaf_buf, o, contributions[i].round);          o = o + 4u;
-        write_u32_le(&leaf_buf, o, contributions[i].holder_index);   o = o + 4u;
-        let plen = contributions[i].payload_len;
-        write_u32_le(&leaf_buf, o, plen);                            o = o + 4u;
-        var written: u32 = 0u;
-        for (var lane: u32 = 0u; lane < 96u; lane = lane + 1u) {
-            if (written >= plen) { break; }
-            let v = contributions[i].payload[lane];
-            let take: u32 = min(4u, plen - written);
-            for (var b: u32 = 0u; b < take; b = b + 1u) {
-                leaf_buf[o + b] = (v >> (b * 8u)) & 0xFFu;
-            }
-            o = o + take;
-            written = written + take;
+        if (contribution_used_mask[i] == 0u) { continue; }
+        for (var k: u32 = 0u; k < 32u; k = k + 1u) { fold_buf[k] = acc[k]; }
+        for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+            let v = contribution_leaves[i * 8u + k];
+            fold_buf[32u + k * 4u + 0u] = v & 0xFFu;
+            fold_buf[32u + k * 4u + 1u] = (v >> 8u) & 0xFFu;
+            fold_buf[32u + k * 4u + 2u] = (v >> 16u) & 0xFFu;
+            fold_buf[32u + k * 4u + 3u] = (v >> 24u) & 0xFFu;
         }
-        write_u32_le(&leaf_buf, o, i); o = o + 4u;
-
-        keccak256_buf2048(&leaf_buf, o, &leaf_hash);
-        for (var k: u32 = 0u; k < 32u; k = k + 1u) { fold_buf[k]      = acc[k]; }
-        for (var k: u32 = 0u; k < 32u; k = k + 1u) { fold_buf[32u + k] = leaf_hash[k]; }
         keccak256_buf64(&fold_buf, &acc);
     }
     for (var k: u32 = 0u; k < 8u; k = k + 1u) {
@@ -185,9 +251,13 @@ fn mpcvm_transition(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // -- counts and now/epoch --
+    let n_active  = atomicLoad(&count_outs[0]);
+    let n_final   = atomicLoad(&count_outs[1]);
+    let n_failed  = atomicLoad(&count_outs[2]);
+    let shares_n  = atomicLoad(&count_outs[3]);
     state.active_ceremony_count    = n_active;
-    state.finalized_ceremony_count = finalized;
-    state.failed_ceremony_count    = failed;
+    state.finalized_ceremony_count = n_final;
+    state.failed_ceremony_count    = n_failed;
     state.key_share_count          = shares_n;
     state.now_ns_lo                = desc.timestamp_ns_lo;
     state.now_ns_hi                = desc.timestamp_ns_hi;
@@ -200,11 +270,7 @@ fn mpcvm_transition(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // -- composed mpcvm_state_root --
-    // composed = parent_state_root (32) || ceremony_root (32) || key_share_root (32) ||
-    //            contribution_root (32) || epoch (8) || now (8) || active (4) ||
-    //            finalized (4) || failed (4) || share_count (4)
     var o: u32 = 0u;
-    // parent_state_root: 32 bytes packed in 8 u32 lanes.
     for (var k: u32 = 0u; k < 8u; k = k + 1u) {
         let v = desc.parent_state_root[k];
         leaf_buf[o + 0u] = v & 0xFFu;

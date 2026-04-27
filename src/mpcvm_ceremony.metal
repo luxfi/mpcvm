@@ -1,45 +1,33 @@
 // Copyright (C) 2026, Lux Partners Limited. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// mpcvm_ceremony.metal — state-machine kernel.
+// mpcvm_ceremony.metal — v0.62 per-slot fan-out kernels.
 //
-// One round = three sequential phases (run inline by this kernel):
-//   1. Apply CeremonyOps (begin / cancel) in supplied order.
-//   2. Apply ContributionOps (with dedup) in supplied order.
-//   3. Ceremony sweep:
-//        * threshold met in current round -> advance round / finalize
-//        * deadline elapsed and threshold not met -> mark failed
-//      For finalized keygen ceremonies, emit deterministic key shares.
+// One round = two kernel dispatches:
+//   1. mpcvm_ceremony_apply (1x1x1) — Phase 1 (begin/cancel) + Phase 2
+//      (contributions), processed in canonical input-stream order.
+//      Counter increments (next_contribution_id) and slot placement match
+//      the CPU reference byte-for-byte.
+//   2. mpcvm_ceremony_sweep (gridSize = ceremony_count, workgroup_size =
+//      ceremony_count) — Phase 3 sweep with intra-threadgroup prefix sum
+//      for deterministic share_id assignment.
 //
-// Single-thread execution preserves byte-for-byte determinism with the
-// CPU reference and all other backends.
+// Determinism: slot-order = canonical-order (open-addressing hash is
+// deterministic), so per-slot fan-out preserves byte-equality with CPU.
+// share_ids are allocated by a prefix sum over per-slot emit-counts so the
+// same (ceremony_slot, holder) gets the same share_id as the CPU reference.
 
 #include "mpcvm_kernels_common.h.metal"
 
-// Count contributions for a given (ceremony, round).
-inline uint count_contributions_for(device const Contribution* contributions,
-                                    uint contribution_count,
-                                    ulong ceremony_id, uint round)
-{
-    uint n = 0;
-    for (uint i = 0; i < contribution_count; ++i) {
-        device const Contribution& c = contributions[i];
-        if (c.status != 1u) continue;
-        if (c.ceremony_id == ceremony_id && c.round == round) ++n;
-    }
-    return n;
-}
+// kCeremonySlots — must match kDefaultCeremonySlots in mpcvm_gpu_layout.hpp.
+constant uint kSweepWorkgroupSize = 256u;
 
-// Emit deterministic key shares for a finalized keygen ceremony.
-// share_data := keccak-stretch( ceremony_seed || ceremony_id || holder ||
-//                              "MPCVM-SHARE-V1" || all_round_payloads )
-// truncated to scheme-specific length.
-inline void emit_keygen_shares(device const Ceremony& c,
-                               device const Contribution* contributions,
-                               uint contribution_count,
-                               device KeyShare* shares,
-                               uint share_count,
-                               thread ulong& next_share_id)
+inline void emit_keygen_shares_for(device const Ceremony& c,
+                                   device Contribution* contributions,
+                                   uint contribution_count,
+                                   device KeyShare* shares,
+                                   uint share_count,
+                                   thread ulong& next_share_id)
 {
     uint scheme = scheme_for_kind(c.kind);
     uint out_len = share_data_len_for_scheme(scheme);
@@ -49,7 +37,6 @@ inline void emit_keygen_shares(device const Ceremony& c,
         ulong bit = (ulong)1 << holder;
         if ((c.participants_bitmap & bit) == 0u) continue;
 
-        // Build seed buffer (cap at safe upper bound: prefix 58 + max 5 rounds * 384).
         uchar buf[2048];
         uint o = 0;
         for (uint k = 0; k < 32u; ++k) buf[o++] = c.ceremony_seed[k];
@@ -57,21 +44,17 @@ inline void emit_keygen_shares(device const Ceremony& c,
         absorb_u32(buf, o, holder);        o += 4;
         const uchar tag[14] = {'M','P','C','V','M','-','S','H','A','R','E','-','V','1'};
         for (uint k = 0; k < 14u; ++k) buf[o++] = tag[k];
+        // Hash-lookup the contribution for (cid, r, holder) instead of
+        // scanning the whole table — O(1) vs O(N).
         for (uint r = 0; r < total_rounds; ++r) {
-            // find contribution for (cid, r, holder)
-            for (uint i = 0; i < contribution_count; ++i) {
-                device const Contribution& cn = contributions[i];
-                if (cn.status != 1u) continue;
-                if (cn.ceremony_id != c.ceremony_id) continue;
-                if (cn.round != r) continue;
-                if (cn.holder_index != holder) continue;
-                for (uint k = 0; k < cn.payload_len && o < 2048u; ++k)
-                    buf[o++] = cn.payload[k];
-                break;
-            }
+            uint ci = contribution_locate(contributions, contribution_count,
+                                          c.ceremony_id, r, holder, false);
+            if (ci == 0xFFFFFFFFu) continue;
+            device const Contribution& cn = contributions[ci];
+            for (uint k = 0; k < cn.payload_len && o < 2048u; ++k)
+                buf[o++] = cn.payload[k];
         }
 
-        // Reserve slot.
         uint kidx = key_share_locate_free(shares, share_count, c.ceremony_id, holder);
         if (kidx == 0xFFFFFFFFu) continue;
         device KeyShare& ks = shares[kidx];
@@ -102,36 +85,29 @@ inline void emit_keygen_shares(device const Ceremony& c,
     }
 }
 
-kernel void mpcvm_ceremony_step(
+// =============================================================================
+// Phase 1+2: serial ops apply (canonical input-stream order).
+// =============================================================================
+
+kernel void mpcvm_ceremony_apply(
     device const MPCVMRoundDescriptor* desc                    [[buffer(0)]],
     device const CeremonyOp*           ceremony_ops            [[buffer(1)]],
     device const ContributionOp*       contribution_ops        [[buffer(2)]],
     device Ceremony*                   ceremonies              [[buffer(3)]],
-    device KeyShare*                   key_shares              [[buffer(4)]],
-    device Contribution*               contributions           [[buffer(5)]],
-    device atomic_uint*                ceremony_applied_out    [[buffer(6)]],
-    device atomic_uint*                contribution_applied_out [[buffer(7)]],
-    device atomic_uint*                round_advance_out        [[buffer(8)]],
-    device atomic_uint*                finalized_out            [[buffer(9)]],
-    device atomic_uint*                failed_out               [[buffer(10)]],
-    constant uint&                     ceremony_count           [[buffer(11)]],
-    constant uint&                     key_share_count          [[buffer(12)]],
-    constant uint&                     contribution_count       [[buffer(13)]],
-    constant ulong&                    next_contribution_id_in  [[buffer(14)]],
-    constant ulong&                    next_share_id_in         [[buffer(15)]],
+    device Contribution*               contributions           [[buffer(4)]],
+    device atomic_uint*                ceremony_applied_out    [[buffer(5)]],
+    device atomic_uint*                contribution_applied_out [[buffer(6)]],
+    constant uint&                     ceremony_count           [[buffer(7)]],
+    constant uint&                     contribution_count       [[buffer(8)]],
+    constant ulong&                    next_contribution_id_in  [[buffer(9)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid != 0u) return;
 
     uint cer_applied = 0;
     uint cnt_applied = 0;
-    uint advances = 0;
-    uint finalized = 0;
-    uint failed = 0;
     ulong next_cont_id = next_contribution_id_in;
-    ulong next_sh_id = next_share_id_in;
 
-    // Phase 1: ceremony ops.
     uint cer_op_count = desc->ceremony_op_count;
     for (uint i = 0; i < cer_op_count; ++i) {
         device const CeremonyOp& op = ceremony_ops[i];
@@ -163,7 +139,6 @@ kernel void mpcvm_ceremony_step(
         }
     }
 
-    // Phase 2: contribution ops.
     uint cnt_op_count = desc->contribution_op_count;
     for (uint i = 0; i < cnt_op_count; ++i) {
         device const ContributionOp& op = contribution_ops[i];
@@ -195,42 +170,113 @@ kernel void mpcvm_ceremony_step(
         ++cnt_applied;
     }
 
-    // Phase 3: sweep (advance / finalize / timeout).
-    for (uint i = 0; i < ceremony_count; ++i) {
-        device Ceremony& c = ceremonies[i];
-        if (c.status != kCeremonyStatusInProgress) continue;
+    atomic_store_explicit(ceremony_applied_out,     cer_applied, memory_order_relaxed);
+    atomic_store_explicit(contribution_applied_out, cnt_applied, memory_order_relaxed);
+}
 
-        uint in_round = count_contributions_for(contributions, contribution_count,
-                                                c.ceremony_id, c.round);
-        c.contribution_count = in_round;
+// =============================================================================
+// Phase 3: per-slot fan-out sweep with intra-threadgroup prefix sum for
+// deterministic share_id assignment.
+//
+// Layout: dispatchThreads = (kCeremonySlots, 1, 1),
+//         threadsPerThreadgroup = (kCeremonySlots, 1, 1).
+// All threads live in one threadgroup so threadgroup_barrier syncs the lot.
+// =============================================================================
 
-        if (in_round >= c.threshold) {
-            uint total_rounds = total_rounds_for(c.kind);
-            ++c.round;
-            ++advances;
-            if (c.round >= total_rounds) {
-                c.status = kCeremonyStatusFinalized;
-                ++finalized;
-                if (is_keygen_kind(c.kind)) {
-                    emit_keygen_shares(c, contributions, contribution_count,
-                                       key_shares, key_share_count, next_sh_id);
-                }
-            } else {
-                c.participants_bitmap = 0;
-                c.contribution_count = 0;
+kernel void mpcvm_ceremony_sweep(
+    device const MPCVMRoundDescriptor* desc                    [[buffer(0)]],
+    device Ceremony*                   ceremonies              [[buffer(1)]],
+    device KeyShare*                   key_shares              [[buffer(2)]],
+    device Contribution*               contributions           [[buffer(3)]],
+    device atomic_uint*                round_advance_out       [[buffer(4)]],
+    device atomic_uint*                finalized_out           [[buffer(5)]],
+    device atomic_uint*                failed_out              [[buffer(6)]],
+    constant uint&                     ceremony_count          [[buffer(7)]],
+    constant uint&                     key_share_count         [[buffer(8)]],
+    constant uint&                     contribution_count      [[buffer(9)]],
+    constant ulong&                    next_share_id_in        [[buffer(10)]],
+    threadgroup uint*                  emit_counts             [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    // Each tid owns ceremonies[tid]. Threads beyond ceremony_count idle.
+    bool in_range = tid < ceremony_count;
+
+    // Phase A: per-slot decision (advance/finalize/timeout) and emit_count.
+    uint local_emit_count = 0u;
+    bool will_finalize_keygen = false;
+    bool will_advance         = false;
+    bool will_timeout         = false;
+    uint in_round_total       = 0u;
+    if (in_range) {
+        device Ceremony& c = ceremonies[tid];
+        if (c.status == kCeremonyStatusInProgress) {
+            uint in_round = 0;
+            for (uint i = 0; i < contribution_count; ++i) {
+                device const Contribution& cn = contributions[i];
+                if (cn.status != 1u) continue;
+                if (cn.ceremony_id == c.ceremony_id && cn.round == c.round) ++in_round;
             }
-            continue;
-        }
+            in_round_total = in_round;
 
-        if (desc->timestamp_ns > c.deadline_ns) {
-            c.status = kCeremonyStatusFailed;
-            ++failed;
+            if (in_round >= c.threshold) {
+                will_advance = true;
+                uint total_rounds = total_rounds_for(c.kind);
+                if (c.round + 1u >= total_rounds && is_keygen_kind(c.kind)) {
+                    will_finalize_keygen = true;
+                    for (uint h = 0; h < c.total_participants; ++h) {
+                        ulong bit = (ulong)1 << h;
+                        if ((c.participants_bitmap & bit) != 0u) ++local_emit_count;
+                    }
+                }
+            } else if (desc->timestamp_ns > c.deadline_ns) {
+                will_timeout = true;
+            }
+        }
+    }
+    emit_counts[tid] = local_emit_count;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase B: prefix sum over emit_counts on tid 0 (small N=256).
+    // We compute exclusive prefix sum so emit_counts[tid] becomes the
+    // base_share_id offset for ceremony slot tid.
+    if (tid == 0u) {
+        uint acc = 0u;
+        for (uint i = 0; i < kSweepWorkgroupSize; ++i) {
+            uint v = emit_counts[i];
+            emit_counts[i] = acc;
+            acc += v;
         }
     }
 
-    atomic_store_explicit(ceremony_applied_out,     cer_applied, memory_order_relaxed);
-    atomic_store_explicit(contribution_applied_out, cnt_applied, memory_order_relaxed);
-    atomic_store_explicit(round_advance_out,        advances,    memory_order_relaxed);
-    atomic_store_explicit(finalized_out,            finalized,   memory_order_relaxed);
-    atomic_store_explicit(failed_out,               failed,      memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase C: actually advance/finalize/timeout, emitting shares with the
+    // correct base_share_id.
+    if (in_range) {
+        device Ceremony& c = ceremonies[tid];
+        if (c.status == kCeremonyStatusInProgress) {
+            c.contribution_count = in_round_total;
+            if (will_advance) {
+                ++c.round;
+                atomic_fetch_add_explicit(round_advance_out, 1u, memory_order_relaxed);
+                uint total_rounds = total_rounds_for(c.kind);
+                if (c.round >= total_rounds) {
+                    c.status = kCeremonyStatusFinalized;
+                    atomic_fetch_add_explicit(finalized_out, 1u, memory_order_relaxed);
+                    if (will_finalize_keygen) {
+                        ulong base = next_share_id_in + (ulong)emit_counts[tid];
+                        emit_keygen_shares_for(c, contributions, contribution_count,
+                                               key_shares, key_share_count, base);
+                    }
+                } else {
+                    c.participants_bitmap = 0;
+                    c.contribution_count = 0;
+                }
+            } else if (will_timeout) {
+                c.status = kCeremonyStatusFailed;
+                atomic_fetch_add_explicit(failed_out, 1u, memory_order_relaxed);
+            }
+        }
+    }
 }

@@ -3,13 +3,20 @@
 //
 // mpcvm_gpu_engine.mm — Metal-backed driver for MPCVMGPUEngine.
 //
-// One round = two sequential kernel dispatches in canonical order:
-//   1. mpcvm_ceremony_step   (ceremony begin/cancel + contributions + sweep)
-//   2. mpcvm_transition      (root composition + epoch advance)
+// v0.62: per-slot fan-out + parallel leaf reduction.
+// One round = four kernel dispatches in canonical order:
+//   1. mpcvm_ceremony_apply  (1x1x1) — Phase 1+2 ops apply, serial
+//   2. mpcvm_ceremony_sweep  (kCeremonySlots threads, 1 threadgroup) —
+//                              Phase 3 sweep with intra-threadgroup
+//                              prefix-sum for share_id allocation
+//   3. mpcvm_compute_leaves  (max(slot counts) threads) — parallel keccak
+//                              of leaves into precomputed leaf-hash arenas
+//   4. mpcvm_compose_root    (1x1x1) — serial fold + state-root composition
 //
-// Each dispatch is a single thread (1x1x1) — the kernels do canonical
-// in-order traversal of their op streams. Determinism contract matches
-// the CPU reference (mpcvm_cpu_reference.cpp) byte-for-byte.
+// Determinism contract matches the CPU reference (mpcvm_cpu_reference.cpp)
+// byte-for-byte; per-slot fan-out preserves canonical ordering because the
+// open-addressing hash places each (cid, round, holder) at a deterministic
+// slot.
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -121,6 +128,14 @@ constexpr uint32_t kCeremonySlots    = kDefaultCeremonySlots;
 constexpr uint32_t kKeyShareSlots    = kDefaultKeyShareSlots;
 constexpr uint32_t kContributionSlots= kDefaultContributionSlots;
 constexpr uint32_t kMaxOpsPerRound   = 4096u;
+constexpr uint32_t kSweepThreads     = kCeremonySlots;  // must match kSweepWorkgroupSize in mpcvm_ceremony.metal
+
+// Maximum slot index covered by mpcvm_compute_leaves (each thread checks
+// its tid against ceremony/share/contribution counts independently).
+constexpr uint32_t kLeafThreads = (kContributionSlots > kKeyShareSlots
+    ? kContributionSlots : kKeyShareSlots) > kCeremonySlots
+        ? (kContributionSlots > kKeyShareSlots ? kContributionSlots : kKeyShareSlots)
+        : kCeremonySlots;
 
 struct Round {
     MPCVMRoundHandle handle{};
@@ -142,17 +157,32 @@ struct Round {
     id<MTLBuffer> round_advance_buf         = nil;
     id<MTLBuffer> finalized_buf             = nil;
     id<MTLBuffer> failed_buf                = nil;
+
+    // v0.62: parallel-fold scratch.
+    id<MTLBuffer> ceremony_leaf_hashes      = nil;
+    id<MTLBuffer> share_leaf_hashes         = nil;
+    id<MTLBuffer> contribution_leaf_hashes  = nil;
+    id<MTLBuffer> ceremony_used_mask        = nil;
+    id<MTLBuffer> share_used_mask           = nil;
+    id<MTLBuffer> contribution_used_mask    = nil;
+    id<MTLBuffer> active_count_buf          = nil;
+    id<MTLBuffer> finalized_count_buf       = nil;
+    id<MTLBuffer> failed_count_buf          = nil;
+    id<MTLBuffer> share_count_buf           = nil;
 };
 
 class MPCVMGPUEngineMetal final : public MPCVMGPUEngine {
 public:
     MPCVMGPUEngineMetal(id<MTLDevice> device,
                         id<MTLCommandQueue> queue,
-                        id<MTLComputePipelineState> ceremony_pso,
-                        id<MTLComputePipelineState> transition_pso,
+                        id<MTLComputePipelineState> apply_pso,
+                        id<MTLComputePipelineState> sweep_pso,
+                        id<MTLComputePipelineState> leaves_pso,
+                        id<MTLComputePipelineState> compose_pso,
                         NSString* device_name)
         : device_(device), queue_(queue),
-          ceremony_pso_(ceremony_pso), transition_pso_(transition_pso),
+          apply_pso_(apply_pso), sweep_pso_(sweep_pso),
+          leaves_pso_(leaves_pso), compose_pso_(compose_pso),
           device_name_str_([device_name UTF8String]) {}
 
     ~MPCVMGPUEngineMetal() override {
@@ -183,11 +213,28 @@ public:
         round_.finalized_buf             = [device_ newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
         round_.failed_buf                = [device_ newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
 
+        round_.ceremony_leaf_hashes     = [device_ newBufferWithLength:32u * kCeremonySlots options:MTLResourceStorageModeShared];
+        round_.share_leaf_hashes        = [device_ newBufferWithLength:32u * kKeyShareSlots options:MTLResourceStorageModeShared];
+        round_.contribution_leaf_hashes = [device_ newBufferWithLength:32u * kContributionSlots options:MTLResourceStorageModeShared];
+        round_.ceremony_used_mask       = [device_ newBufferWithLength:kCeremonySlots options:MTLResourceStorageModeShared];
+        round_.share_used_mask          = [device_ newBufferWithLength:kKeyShareSlots options:MTLResourceStorageModeShared];
+        round_.contribution_used_mask   = [device_ newBufferWithLength:kContributionSlots options:MTLResourceStorageModeShared];
+        round_.active_count_buf         = [device_ newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        round_.finalized_count_buf      = [device_ newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        round_.failed_count_buf         = [device_ newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        round_.share_count_buf          = [device_ newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+
         if (!round_.desc_buf || !round_.ceremony_ops_buf || !round_.contribution_ops_buf
             || !round_.ceremonies_buf || !round_.key_shares_buf || !round_.contributions_buf
             || !round_.state_buf || !round_.result_buf
             || !round_.ceremony_applied_buf || !round_.contribution_applied_buf
-            || !round_.round_advance_buf || !round_.finalized_buf || !round_.failed_buf)
+            || !round_.round_advance_buf || !round_.finalized_buf || !round_.failed_buf
+            || !round_.ceremony_leaf_hashes || !round_.share_leaf_hashes
+            || !round_.contribution_leaf_hashes
+            || !round_.ceremony_used_mask || !round_.share_used_mask
+            || !round_.contribution_used_mask
+            || !round_.active_count_buf || !round_.finalized_count_buf
+            || !round_.failed_count_buf || !round_.share_count_buf)
             return MPCVMRoundHandle{0};
 
         std::memset([round_.ceremonies_buf contents],    0, sizeof(Ceremony) * kCeremonySlots);
@@ -195,11 +242,18 @@ public:
         std::memset([round_.contributions_buf contents], 0, sizeof(Contribution) * kContributionSlots);
         std::memset([round_.state_buf contents],         0, sizeof(MPCVMState));
         std::memset([round_.result_buf contents],        0, sizeof(MPCVMTransitionResult));
+        std::memset([round_.ceremony_used_mask contents],     0, kCeremonySlots);
+        std::memset([round_.share_used_mask contents],        0, kKeyShareSlots);
+        std::memset([round_.contribution_used_mask contents], 0, kContributionSlots);
         *static_cast<uint32_t*>([round_.ceremony_applied_buf contents]) = 0;
         *static_cast<uint32_t*>([round_.contribution_applied_buf contents]) = 0;
         *static_cast<uint32_t*>([round_.round_advance_buf contents]) = 0;
         *static_cast<uint32_t*>([round_.finalized_buf contents]) = 0;
         *static_cast<uint32_t*>([round_.failed_buf contents]) = 0;
+        *static_cast<uint32_t*>([round_.active_count_buf contents]) = 0;
+        *static_cast<uint32_t*>([round_.finalized_count_buf contents]) = 0;
+        *static_cast<uint32_t*>([round_.failed_count_buf contents]) = 0;
+        *static_cast<uint32_t*>([round_.share_count_buf contents]) = 0;
 
         round_.desc.ceremony_op_count = 0;
         round_.desc.contribution_op_count = 0;
@@ -252,43 +306,92 @@ public:
         uint64_t next_cont_v          = round_.next_contribution_id;
         uint64_t next_share_v         = round_.next_share_id;
 
-        // -- ceremony step --
+        // -- 1. Ceremony apply (Phase 1+2 ops, serial 1x1x1) --
         {
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            [enc setComputePipelineState:ceremony_pso_];
+            [enc setComputePipelineState:apply_pso_];
             [enc setBuffer:round_.desc_buf             offset:0 atIndex:0];
             [enc setBuffer:round_.ceremony_ops_buf     offset:0 atIndex:1];
             [enc setBuffer:round_.contribution_ops_buf offset:0 atIndex:2];
             [enc setBuffer:round_.ceremonies_buf       offset:0 atIndex:3];
-            [enc setBuffer:round_.key_shares_buf       offset:0 atIndex:4];
-            [enc setBuffer:round_.contributions_buf    offset:0 atIndex:5];
-            [enc setBuffer:round_.ceremony_applied_buf offset:0 atIndex:6];
-            [enc setBuffer:round_.contribution_applied_buf offset:0 atIndex:7];
-            [enc setBuffer:round_.round_advance_buf    offset:0 atIndex:8];
-            [enc setBuffer:round_.finalized_buf        offset:0 atIndex:9];
-            [enc setBuffer:round_.failed_buf           offset:0 atIndex:10];
-            [enc setBytes:&ceremony_count_v     length:sizeof(ceremony_count_v)     atIndex:11];
-            [enc setBytes:&key_share_count_v    length:sizeof(key_share_count_v)    atIndex:12];
-            [enc setBytes:&contribution_count_v length:sizeof(contribution_count_v) atIndex:13];
-            [enc setBytes:&next_cont_v          length:sizeof(next_cont_v)          atIndex:14];
-            [enc setBytes:&next_share_v         length:sizeof(next_share_v)         atIndex:15];
+            [enc setBuffer:round_.contributions_buf    offset:0 atIndex:4];
+            [enc setBuffer:round_.ceremony_applied_buf offset:0 atIndex:5];
+            [enc setBuffer:round_.contribution_applied_buf offset:0 atIndex:6];
+            [enc setBytes:&ceremony_count_v     length:sizeof(ceremony_count_v)     atIndex:7];
+            [enc setBytes:&contribution_count_v length:sizeof(contribution_count_v) atIndex:8];
+            [enc setBytes:&next_cont_v          length:sizeof(next_cont_v)          atIndex:9];
             [enc dispatchThreads:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
             [enc endEncoding];
         }
-        // -- transition (root composition) --
+        // -- 2. Ceremony sweep (Phase 3, kSweepThreads in one threadgroup) --
         {
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            [enc setComputePipelineState:transition_pso_];
-            [enc setBuffer:round_.desc_buf          offset:0 atIndex:0];
-            [enc setBuffer:round_.ceremonies_buf    offset:0 atIndex:1];
-            [enc setBuffer:round_.key_shares_buf    offset:0 atIndex:2];
-            [enc setBuffer:round_.contributions_buf offset:0 atIndex:3];
-            [enc setBuffer:round_.state_buf         offset:0 atIndex:4];
-            [enc setBuffer:round_.result_buf        offset:0 atIndex:5];
-            [enc setBytes:&ceremony_count_v     length:sizeof(ceremony_count_v)     atIndex:6];
-            [enc setBytes:&key_share_count_v    length:sizeof(key_share_count_v)    atIndex:7];
-            [enc setBytes:&contribution_count_v length:sizeof(contribution_count_v) atIndex:8];
+            [enc setComputePipelineState:sweep_pso_];
+            [enc setBuffer:round_.desc_buf             offset:0 atIndex:0];
+            [enc setBuffer:round_.ceremonies_buf       offset:0 atIndex:1];
+            [enc setBuffer:round_.key_shares_buf       offset:0 atIndex:2];
+            [enc setBuffer:round_.contributions_buf    offset:0 atIndex:3];
+            [enc setBuffer:round_.round_advance_buf    offset:0 atIndex:4];
+            [enc setBuffer:round_.finalized_buf        offset:0 atIndex:5];
+            [enc setBuffer:round_.failed_buf           offset:0 atIndex:6];
+            [enc setBytes:&ceremony_count_v     length:sizeof(ceremony_count_v)     atIndex:7];
+            [enc setBytes:&key_share_count_v    length:sizeof(key_share_count_v)    atIndex:8];
+            [enc setBytes:&contribution_count_v length:sizeof(contribution_count_v) atIndex:9];
+            [enc setBytes:&next_share_v         length:sizeof(next_share_v)         atIndex:10];
+            [enc setThreadgroupMemoryLength:sizeof(uint32_t) * kSweepThreads atIndex:0];
+            [enc dispatchThreads:MTLSizeMake(kSweepThreads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(kSweepThreads, 1, 1)];
+            [enc endEncoding];
+        }
+        // -- 3. Compute leaves (parallel keccak per slot) --
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:leaves_pso_];
+            [enc setBuffer:round_.ceremonies_buf            offset:0 atIndex:0];
+            [enc setBuffer:round_.key_shares_buf            offset:0 atIndex:1];
+            [enc setBuffer:round_.contributions_buf         offset:0 atIndex:2];
+            [enc setBuffer:round_.ceremony_leaf_hashes      offset:0 atIndex:3];
+            [enc setBuffer:round_.share_leaf_hashes         offset:0 atIndex:4];
+            [enc setBuffer:round_.contribution_leaf_hashes  offset:0 atIndex:5];
+            [enc setBuffer:round_.active_count_buf          offset:0 atIndex:6];
+            [enc setBuffer:round_.finalized_count_buf       offset:0 atIndex:7];
+            [enc setBuffer:round_.failed_count_buf          offset:0 atIndex:8];
+            [enc setBuffer:round_.share_count_buf           offset:0 atIndex:9];
+            [enc setBuffer:round_.ceremony_used_mask        offset:0 atIndex:10];
+            [enc setBuffer:round_.share_used_mask           offset:0 atIndex:11];
+            [enc setBuffer:round_.contribution_used_mask    offset:0 atIndex:12];
+            [enc setBytes:&ceremony_count_v     length:sizeof(ceremony_count_v)     atIndex:13];
+            [enc setBytes:&key_share_count_v    length:sizeof(key_share_count_v)    atIndex:14];
+            [enc setBytes:&contribution_count_v length:sizeof(contribution_count_v) atIndex:15];
+            // Use a threadgroup sized for the device (Metal recommends 128-256
+            // for compute kernels with small per-thread work). Dispatch fewer
+            // threads than the union; each thread bounds-checks its tid.
+            uint32_t threadgroup = 256u;
+            [enc dispatchThreads:MTLSizeMake(kLeafThreads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadgroup, 1, 1)];
+            [enc endEncoding];
+        }
+        // -- 4. Compose root (serial fold + state-root composition) --
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:compose_pso_];
+            [enc setBuffer:round_.desc_buf                  offset:0 atIndex:0];
+            [enc setBuffer:round_.ceremony_leaf_hashes      offset:0 atIndex:1];
+            [enc setBuffer:round_.share_leaf_hashes         offset:0 atIndex:2];
+            [enc setBuffer:round_.contribution_leaf_hashes  offset:0 atIndex:3];
+            [enc setBuffer:round_.ceremony_used_mask        offset:0 atIndex:4];
+            [enc setBuffer:round_.share_used_mask           offset:0 atIndex:5];
+            [enc setBuffer:round_.contribution_used_mask    offset:0 atIndex:6];
+            [enc setBuffer:round_.active_count_buf          offset:0 atIndex:7];
+            [enc setBuffer:round_.finalized_count_buf       offset:0 atIndex:8];
+            [enc setBuffer:round_.failed_count_buf          offset:0 atIndex:9];
+            [enc setBuffer:round_.share_count_buf           offset:0 atIndex:10];
+            [enc setBuffer:round_.state_buf                 offset:0 atIndex:11];
+            [enc setBuffer:round_.result_buf                offset:0 atIndex:12];
+            [enc setBytes:&ceremony_count_v     length:sizeof(ceremony_count_v)     atIndex:13];
+            [enc setBytes:&key_share_count_v    length:sizeof(key_share_count_v)    atIndex:14];
+            [enc setBytes:&contribution_count_v length:sizeof(contribution_count_v) atIndex:15];
             [enc dispatchThreads:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
             [enc endEncoding];
@@ -309,13 +412,9 @@ public:
         result->finalized_this_round     = finalized;
         result->failed_this_round        = failed;
 
-        // Bump next_* counters by what was applied this round.
         round_.next_contribution_id += cnt_app;
-        // share IDs: each finalized keygen ceremony emits up to total_participants
-        // shares — we don't know the exact total without scanning, so the host
-        // does not depend on next_share_id continuity within a single engine
-        // session for determinism. The leaf encoding uses share_id from the
-        // table itself, which the kernel writes.
+        // share_id allocation lives on-device; the host counter is monotonic
+        // but not strictly continuous within a session — same contract as v0.61.
         return *result;
     }
 
@@ -339,8 +438,10 @@ private:
 
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> ceremony_pso_;
-    id<MTLComputePipelineState> transition_pso_;
+    id<MTLComputePipelineState> apply_pso_;
+    id<MTLComputePipelineState> sweep_pso_;
+    id<MTLComputePipelineState> leaves_pso_;
+    id<MTLComputePipelineState> compose_pso_;
     std::string device_name_str_;
     Round round_;
     uint64_t next_handle_ = 0;
@@ -373,12 +474,15 @@ std::unique_ptr<MPCVMGPUEngine> MPCVMGPUEngine::create() {
                              [name UTF8String], [[err localizedDescription] UTF8String]);
             return p;
         };
-        id<MTLComputePipelineState> cer_pso = fn(@"mpcvm_ceremony_step");
-        id<MTLComputePipelineState> tr_pso  = fn(@"mpcvm_transition");
-        if (!cer_pso || !tr_pso) return nullptr;
+        id<MTLComputePipelineState> apply_pso   = fn(@"mpcvm_ceremony_apply");
+        id<MTLComputePipelineState> sweep_pso   = fn(@"mpcvm_ceremony_sweep");
+        id<MTLComputePipelineState> leaves_pso  = fn(@"mpcvm_compute_leaves");
+        id<MTLComputePipelineState> compose_pso = fn(@"mpcvm_compose_root");
+        if (!apply_pso || !sweep_pso || !leaves_pso || !compose_pso) return nullptr;
 
         return std::unique_ptr<MPCVMGPUEngine>(
-            new MPCVMGPUEngineMetal(device, queue, cer_pso, tr_pso, [device name]));
+            new MPCVMGPUEngineMetal(device, queue, apply_pso, sweep_pso,
+                                    leaves_pso, compose_pso, [device name]));
     }
 }
 

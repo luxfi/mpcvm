@@ -3,9 +3,13 @@
 //
 // mpcvm_gpu_engine_cuda.cpp — CUDA-backed driver for MPCVMGPUEngine.
 //
-// Mirrors the Metal driver: one round = two sequential kernel launches.
-// Each launch is <<<1, 1>>> — single-thread canonical traversal preserves
-// byte-for-byte determinism with the CPU reference and the Metal driver.
+// v0.62: per-slot fan-out + parallel leaf reduction (mirror of Metal).
+// One round = four kernel launches in canonical order:
+//   1. mpcvm_ceremony_apply  <<<1, 1>>>            — Phase 1+2 ops apply
+//   2. mpcvm_ceremony_sweep  <<<1, 256, smem>>>    — Phase 3 sweep + prefix
+//                                                    sum + share emission
+//   3. mpcvm_compute_leaves  <<<grid, 64>>>        — parallel keccak per leaf
+//   4. mpcvm_compose_root    <<<1, 1>>>            — serial fold + state root
 
 #include "lux/mpcvm/mpcvm_gpu_engine.hpp"
 
@@ -22,29 +26,61 @@ namespace mpcvm::gpu {
 
 extern "C" {
 
-void mpcvm_ceremony_step(
+void mpcvm_ceremony_apply(
     const MPCVMRoundDescriptor* desc,
     const CeremonyOp*           ceremony_ops,
     const ContributionOp*       contribution_ops,
     Ceremony*                   ceremonies,
-    KeyShare*                   key_shares,
     Contribution*               contributions,
     uint32_t*                   ceremony_applied_out,
     uint32_t*                   contribution_applied_out,
+    uint32_t                    ceremony_count,
+    uint32_t                    contribution_count,
+    uint64_t                    next_contribution_id_in);
+
+void mpcvm_ceremony_sweep(
+    const MPCVMRoundDescriptor* desc,
+    Ceremony*                   ceremonies,
+    KeyShare*                   key_shares,
+    Contribution*               contributions,
     uint32_t*                   round_advance_out,
     uint32_t*                   finalized_out,
     uint32_t*                   failed_out,
     uint32_t                    ceremony_count,
     uint32_t                    key_share_count,
     uint32_t                    contribution_count,
-    uint64_t                    next_contribution_id_in,
     uint64_t                    next_share_id_in);
 
-void mpcvm_transition(
+void mpcvm_compute_leaves(
+    const Ceremony*    ceremonies,
+    const KeyShare*    shares,
+    const Contribution* contributions,
+    uint8_t*           ceremony_leaf_hashes,
+    uint8_t*           share_leaf_hashes,
+    uint8_t*           contribution_leaf_hashes,
+    uint32_t*          active_count_out,
+    uint32_t*          finalized_count_out,
+    uint32_t*          failed_count_out,
+    uint32_t*          share_count_out,
+    uint8_t*           ceremony_used_mask,
+    uint8_t*           share_used_mask,
+    uint8_t*           contribution_used_mask,
+    uint32_t           ceremony_count,
+    uint32_t           share_count,
+    uint32_t           contribution_count);
+
+void mpcvm_compose_root(
     const MPCVMRoundDescriptor* desc,
-    Ceremony*                   ceremonies,
-    KeyShare*                   shares,
-    Contribution*               contributions,
+    const uint8_t*              ceremony_leaf_hashes,
+    const uint8_t*              share_leaf_hashes,
+    const uint8_t*              contribution_leaf_hashes,
+    const uint8_t*              ceremony_used_mask,
+    const uint8_t*              share_used_mask,
+    const uint8_t*              contribution_used_mask,
+    const uint32_t*             active_count_in,
+    const uint32_t*             finalized_count_in,
+    const uint32_t*             failed_count_in,
+    const uint32_t*             share_count_in,
     MPCVMState*                 state,
     MPCVMTransitionResult*      result,
     uint32_t                    ceremony_count,
@@ -59,6 +95,8 @@ constexpr uint32_t kCeremonySlots    = kDefaultCeremonySlots;
 constexpr uint32_t kKeyShareSlots    = kDefaultKeyShareSlots;
 constexpr uint32_t kContributionSlots= kDefaultContributionSlots;
 constexpr uint32_t kMaxOpsPerRound   = 4096u;
+constexpr uint32_t kSweepThreads     = 256u;
+constexpr uint32_t kLeafThreads      = kContributionSlots;
 
 #define CUDA_CHECK(expr) \
     do { cudaError_t err__ = (expr); if (err__ != cudaSuccess) { \
@@ -84,6 +122,18 @@ struct Round {
     uint32_t* d_round_advance = nullptr;
     uint32_t* d_finalized = nullptr;
     uint32_t* d_failed = nullptr;
+
+    // v0.62 leaf-fold scratch.
+    uint8_t*  d_ceremony_leaf_hashes      = nullptr;
+    uint8_t*  d_share_leaf_hashes         = nullptr;
+    uint8_t*  d_contribution_leaf_hashes  = nullptr;
+    uint8_t*  d_ceremony_used_mask        = nullptr;
+    uint8_t*  d_share_used_mask           = nullptr;
+    uint8_t*  d_contribution_used_mask    = nullptr;
+    uint32_t* d_active_count              = nullptr;
+    uint32_t* d_finalized_count           = nullptr;
+    uint32_t* d_failed_count              = nullptr;
+    uint32_t* d_share_count               = nullptr;
 
     std::vector<CeremonyOp> h_cer_ops;
     std::vector<ContributionOp> h_cnt_ops;
@@ -117,12 +167,18 @@ public:
 
         if (!alloc_buffers()) return MPCVMRoundHandle{0};
 
-        // Zero device arenas.
         cudaMemset(round_.d_ceremonies,    0, sizeof(Ceremony) * kCeremonySlots);
         cudaMemset(round_.d_key_shares,    0, sizeof(KeyShare) * kKeyShareSlots);
         cudaMemset(round_.d_contributions, 0, sizeof(Contribution) * kContributionSlots);
         cudaMemset(round_.d_state,         0, sizeof(MPCVMState));
         cudaMemset(round_.d_result,        0, sizeof(MPCVMTransitionResult));
+        cudaMemset(round_.d_ceremony_used_mask,    0, kCeremonySlots);
+        cudaMemset(round_.d_share_used_mask,       0, kKeyShareSlots);
+        cudaMemset(round_.d_contribution_used_mask, 0, kContributionSlots);
+        cudaMemset(round_.d_active_count,    0, sizeof(uint32_t));
+        cudaMemset(round_.d_finalized_count, 0, sizeof(uint32_t));
+        cudaMemset(round_.d_failed_count,    0, sizeof(uint32_t));
+        cudaMemset(round_.d_share_count,     0, sizeof(uint32_t));
 
         round_.handle = MPCVMRoundHandle{++next_handle_};
         return round_.handle;
@@ -176,19 +232,46 @@ public:
         cudaMemcpy(round_.d_round_advance,        &zero, sizeof(uint32_t), cudaMemcpyHostToDevice);
         cudaMemcpy(round_.d_finalized,            &zero, sizeof(uint32_t), cudaMemcpyHostToDevice);
         cudaMemcpy(round_.d_failed,               &zero, sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(round_.d_active_count,    &zero, sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(round_.d_finalized_count, &zero, sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(round_.d_failed_count,    &zero, sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(round_.d_share_count,     &zero, sizeof(uint32_t), cudaMemcpyHostToDevice);
 
-        mpcvm_ceremony_step<<<1, 1>>>(
+        // -- 1. Apply (1×1) --
+        mpcvm_ceremony_apply<<<1, 1>>>(
             round_.d_desc, round_.d_ceremony_ops, round_.d_contribution_ops,
-            round_.d_ceremonies, round_.d_key_shares, round_.d_contributions,
+            round_.d_ceremonies, round_.d_contributions,
             round_.d_ceremony_applied, round_.d_contribution_applied,
-            round_.d_round_advance, round_.d_finalized, round_.d_failed,
-            kCeremonySlots, kKeyShareSlots, kContributionSlots,
-            round_.next_contribution_id, round_.next_share_id);
+            kCeremonySlots, kContributionSlots,
+            round_.next_contribution_id);
         cudaDeviceSynchronize();
 
-        mpcvm_transition<<<1, 1>>>(
-            round_.d_desc, round_.d_ceremonies, round_.d_key_shares,
-            round_.d_contributions, round_.d_state, round_.d_result,
+        // -- 2. Sweep (1×256, dynamic shared mem for prefix sum) --
+        mpcvm_ceremony_sweep<<<1, kSweepThreads, sizeof(uint32_t) * kSweepThreads>>>(
+            round_.d_desc,
+            round_.d_ceremonies, round_.d_key_shares, round_.d_contributions,
+            round_.d_round_advance, round_.d_finalized, round_.d_failed,
+            kCeremonySlots, kKeyShareSlots, kContributionSlots,
+            round_.next_share_id);
+        cudaDeviceSynchronize();
+
+        // -- 3. Compute leaves (parallel) --
+        uint32_t leaf_blocks = (kLeafThreads + 63u) / 64u;
+        mpcvm_compute_leaves<<<leaf_blocks, 64>>>(
+            round_.d_ceremonies, round_.d_key_shares, round_.d_contributions,
+            round_.d_ceremony_leaf_hashes, round_.d_share_leaf_hashes, round_.d_contribution_leaf_hashes,
+            round_.d_active_count, round_.d_finalized_count, round_.d_failed_count, round_.d_share_count,
+            round_.d_ceremony_used_mask, round_.d_share_used_mask, round_.d_contribution_used_mask,
+            kCeremonySlots, kKeyShareSlots, kContributionSlots);
+        cudaDeviceSynchronize();
+
+        // -- 4. Compose root (1×1) --
+        mpcvm_compose_root<<<1, 1>>>(
+            round_.d_desc,
+            round_.d_ceremony_leaf_hashes, round_.d_share_leaf_hashes, round_.d_contribution_leaf_hashes,
+            round_.d_ceremony_used_mask, round_.d_share_used_mask, round_.d_contribution_used_mask,
+            round_.d_active_count, round_.d_finalized_count, round_.d_failed_count, round_.d_share_count,
+            round_.d_state, round_.d_result,
             kCeremonySlots, kKeyShareSlots, kContributionSlots);
         cudaDeviceSynchronize();
 
@@ -208,7 +291,6 @@ public:
         result.failed_this_round        = failed;
         round_.next_contribution_id    += cnt_app;
 
-        // Cache last result on host.
         last_result_ = result;
         return result;
     }
@@ -246,6 +328,16 @@ private:
         CUDA_CHECK(cudaMalloc(&round_.d_round_advance, sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&round_.d_finalized, sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&round_.d_failed, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&round_.d_ceremony_leaf_hashes,    32u * kCeremonySlots));
+        CUDA_CHECK(cudaMalloc(&round_.d_share_leaf_hashes,       32u * kKeyShareSlots));
+        CUDA_CHECK(cudaMalloc(&round_.d_contribution_leaf_hashes,32u * kContributionSlots));
+        CUDA_CHECK(cudaMalloc(&round_.d_ceremony_used_mask,    kCeremonySlots));
+        CUDA_CHECK(cudaMalloc(&round_.d_share_used_mask,       kKeyShareSlots));
+        CUDA_CHECK(cudaMalloc(&round_.d_contribution_used_mask, kContributionSlots));
+        CUDA_CHECK(cudaMalloc(&round_.d_active_count,    sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&round_.d_finalized_count, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&round_.d_failed_count,    sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&round_.d_share_count,     sizeof(uint32_t)));
         return true;
     }
     void free_buffers() {
@@ -262,6 +354,16 @@ private:
         cudaFree(round_.d_round_advance);
         cudaFree(round_.d_finalized);
         cudaFree(round_.d_failed);
+        cudaFree(round_.d_ceremony_leaf_hashes);
+        cudaFree(round_.d_share_leaf_hashes);
+        cudaFree(round_.d_contribution_leaf_hashes);
+        cudaFree(round_.d_ceremony_used_mask);
+        cudaFree(round_.d_share_used_mask);
+        cudaFree(round_.d_contribution_used_mask);
+        cudaFree(round_.d_active_count);
+        cudaFree(round_.d_finalized_count);
+        cudaFree(round_.d_failed_count);
+        cudaFree(round_.d_share_count);
     }
 
     std::string device_name_str_;

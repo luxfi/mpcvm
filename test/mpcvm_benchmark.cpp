@@ -438,7 +438,7 @@ void run_scenario(const Scenario& sc,
 int main()
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::printf("MPCVM-BENCHMARK\tv0.61.1\n");
+    std::printf("MPCVM-BENCHMARK\tv0.62\n");
 
     auto metal = MPCVMGPUEngine::create();
     std::unique_ptr<MPCVMGPUEngine> wgpu;
