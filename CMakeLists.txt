@@ -9,7 +9,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(lux-mpcvm
-    VERSION 0.61.0
+    VERSION 0.61.1
     DESCRIPTION "GPU-native M-Chain (MPC) ceremony substrate"
     LANGUAGES CXX
 )
@@ -230,6 +230,27 @@ if(LUX_MPCVM_BUILD_TESTS)
         target_compile_definitions(mpcvm-determinism-test PRIVATE LUX_MPCVM_ENABLE_WGPU=1)
     endif()
     add_test(NAME mpcvm-determinism-test COMMAND mpcvm-determinism-test)
+
+    # ---- benchmark harness -------------------------------------------------
+    #
+    # Mirrors the determinism harness link rules but compiles -O3 -DNDEBUG
+    # so the numbers reflect release behaviour.
+    add_executable(mpcvm-benchmark test/mpcvm_benchmark.cpp)
+    target_compile_features(mpcvm-benchmark PRIVATE cxx_std_20)
+    target_compile_options(mpcvm-benchmark PRIVATE -O3 -DNDEBUG)
+    if(LUX_MPCVM_ENABLE_METAL AND APPLE)
+        target_link_libraries(mpcvm-benchmark PRIVATE lux_mpcvm_metal)
+    elseif(LUX_MPCVM_ENABLE_CUDA)
+        target_link_libraries(mpcvm-benchmark PRIVATE lux_mpcvm_cuda)
+    else()
+        target_sources(mpcvm-benchmark PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/mpcvm_engine_stub.cpp)
+        target_link_libraries(mpcvm-benchmark PRIVATE lux_mpcvm_core)
+    endif()
+    if(LUX_MPCVM_ENABLE_WGPU)
+        target_link_libraries(mpcvm-benchmark PRIVATE lux_mpcvm_wgpu)
+        target_compile_definitions(mpcvm-benchmark PRIVATE LUX_MPCVM_ENABLE_WGPU=1)
+    endif()
 endif()
 
 message(STATUS "")

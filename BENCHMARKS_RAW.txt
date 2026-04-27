@@ -1,0 +1,42 @@
+MPCVM-BENCHMARK	v0.61.1
+BACKEND	cpu	CPU reference (host)
+BACKEND	metal	Apple M1 Max
+BACKEND	wgpu	Apple M1 Max
+HEADER	scenario	backend	ceremonies	contribs	mean_ms	p50_ms	p95_ms	p99_ms	cer_per_s	cnt_per_s	speedup
+SCENARIO	micro.frost_keygen	ceremonies=100	contribs=700	chunks=2
+ROW	micro.frost_keygen	cpu	100	700	9.353	9.313	9.596	9.652	10691.4	74839.8	1.00x
+ROW	micro.frost_keygen	metal	100	700	1900.944	1114.097	4659.070	5033.244	52.6	368.2	0.00x
+ROW	micro.frost_keygen	wgpu	100	700	782.006	775.094	804.569	810.169	127.9	895.1	0.01x
+SCENARIO	micro.frost_sign	ceremonies=100	contribs=500	chunks=2
+ROW	micro.frost_sign	cpu	100	500	6.979	6.970	7.027	7.038	14329.1	71645.5	1.00x
+ROW	micro.frost_sign	metal	100	500	204.313	204.385	205.878	206.175	489.4	2447.2	0.03x
+ROW	micro.frost_sign	wgpu	100	500	628.634	628.270	633.534	634.573	159.1	795.4	0.01x
+SCENARIO	micro.cggmp21_keygen	ceremonies=100	contribs=500	chunks=2
+ROW	micro.cggmp21_keygen	cpu	100	500	7.246	7.246	7.353	7.365	13800.5	69002.7	1.00x
+ROW	micro.cggmp21_keygen	metal	100	500	182.412	182.865	183.854	183.941	548.2	2741.0	0.04x
+ROW	micro.cggmp21_keygen	wgpu	100	500	623.337	623.320	623.906	623.920	160.4	802.1	0.01x
+SCENARIO	micro.cggmp21_sign	ceremonies=100	contribs=400	chunks=2
+ROW	micro.cggmp21_sign	cpu	100	400	5.790	5.807	5.853	5.854	17270.2	69080.9	1.00x
+ROW	micro.cggmp21_sign	metal	100	400	293.069	373.520	380.349	380.665	341.2	1364.9	0.02x
+ROW	micro.cggmp21_sign	wgpu	100	400	782.299	740.211	1111.424	1144.288	127.8	511.3	0.01x
+SCENARIO	micro.ringtail_dkg	ceremonies=100	contribs=400	chunks=4
+ROW	micro.ringtail_dkg	cpu	100	400	9.384	9.357	9.458	9.461	10656.4	42625.6	1.00x
+ROW	micro.ringtail_dkg	metal	100	400	239.069	238.568	242.312	242.928	418.3	1673.2	0.04x
+ROW	micro.ringtail_dkg	wgpu	100	400	899.962	899.149	902.182	902.472	111.1	444.5	0.01x
+SCENARIO	small	ceremonies=10	contribs=70	chunks=1
+ROW	small	cpu	10	70	0.921	0.921	0.922	0.922	10852.8	75969.3	1.00x
+ROW	small	metal	10	70	25.354	25.135	25.965	26.024	394.4	2760.9	0.04x
+ROW	small	wgpu	10	70	86.105	86.257	86.763	86.786	116.1	813.0	0.01x
+SCENARIO	medium	ceremonies=200	contribs=1200	chunks=2
+ROW	medium	cpu	200	1200	17.038	17.127	17.264	17.285	11738.7	70432.4	1.00x
+ROW	medium	metal	200	1200	751.848	976.133	984.107	984.412	266.0	1596.1	0.02x
+ROW	medium	wgpu	200	1200	1242.197	1242.396	1244.414	1244.653	161.0	966.0	0.01x
+SCENARIO	large	ceremonies=600	contribs=3200	chunks=7
+ROW	large	cpu	600	3200	52.188	52.047	52.655	52.773	11497.0	61317.1	1.00x
+ROW	large	metal	600	3200	1215.374	1216.076	1223.124	1223.596	493.7	2632.9	0.04x
+ROW	large	wgpu	600	3200	4699.903	4618.640	4956.158	5023.292	127.7	680.9	0.01x
+SCENARIO	xlarge	ceremonies=1000	contribs=5150	chunks=10
+ROW	xlarge	cpu	1000	5150	90.398	87.804	97.809	98.095	11062.2	56970.4	1.00x
+ROW	xlarge	metal	1000	5150	9451.372	6708.377	16746.033	17523.858	105.8	544.9	0.01x
+ROW	xlarge	wgpu	1000	5150	20297.177	9308.381	42306.675	44288.835	49.3	253.7	0.00x
+DONE
