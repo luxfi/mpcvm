@@ -399,11 +399,11 @@ void test_ceremony_cancel()
     PASS("Cancel marks ceremony failed (idempotent)");
 }
 
-void test_ringtail_dkg_finalizes()
+void test_corona_dkg_finalizes()
 {
     auto state = ref::MPCVMReferenceState::empty();
     std::vector<CeremonyOp> begins{
-        make_begin(55u, 3u, 5u, static_cast<uint32_t>(CeremonyKind::RingtailDkg)),
+        make_begin(55u, 3u, 5u, static_cast<uint32_t>(CeremonyKind::CoronaDkg)),
     };
     // 2 rounds, 3 contributions per round (threshold).
     auto desc0 = make_desc(1u);
@@ -418,7 +418,7 @@ void test_ringtail_dkg_finalizes()
     r = ref::run_reference(state, desc1, {}, r1);
     EXPECT("ring.dkg.r1.final",  r.finalized_this_round == 1u);
     EXPECT("ring.dkg.r1.shares", r.key_share_count == 3u);
-    PASS("Ringtail DKG finalizes with 3 lattice shares");
+    PASS("Corona DKG finalizes with 3 lattice shares");
 }
 
 void test_cggmp21_sign_5_rounds()
@@ -514,11 +514,11 @@ void test_root_changes_on_state_change()
     PASS("State root changes when timestamp changes");
 }
 
-void test_ringtail_sign_finalizes()
+void test_corona_sign_finalizes()
 {
     auto state = ref::MPCVMReferenceState::empty();
     std::vector<CeremonyOp> begins{
-        make_begin(601u, 3u, 5u, static_cast<uint32_t>(CeremonyKind::RingtailSign)),
+        make_begin(601u, 3u, 5u, static_cast<uint32_t>(CeremonyKind::CoronaSign)),
     };
     auto desc0 = make_desc(1u);
     std::vector<ContributionOp> r0;
@@ -533,7 +533,7 @@ void test_ringtail_sign_finalizes()
     EXPECT("ring.sg.r1.final", r.finalized_this_round == 1u);
     // Sign is not keygen — no shares emitted.
     EXPECT("ring.sg.r1.no-shares", r.key_share_count == 0u);
-    PASS("Ringtail sign finalizes (no shares)");
+    PASS("Corona sign finalizes (no shares)");
 }
 
 void test_hash_collision_probe()
@@ -695,12 +695,12 @@ int main(int /*argc*/, char** /*argv*/)
     test_concurrent_ceremonies();
     test_empty_round_deterministic();
     test_ceremony_cancel();
-    test_ringtail_dkg_finalizes();
+    test_corona_dkg_finalizes();
     test_cggmp21_sign_5_rounds();
     test_invalid_begin_rejected();
     test_contribution_rejection_paths();
     test_root_changes_on_state_change();
-    test_ringtail_sign_finalizes();
+    test_corona_sign_finalizes();
     test_hash_collision_probe();
     test_duplicate_bitmap_no_double_count();
     test_table_overflow_rejection();

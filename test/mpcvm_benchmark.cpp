@@ -86,7 +86,7 @@ struct WorkloadShape {
     uint64_t frost_sign     = 0;   ///< 5-of-7
     uint64_t cggmp21_keygen = 0;   ///< 5-of-9
     uint64_t cggmp21_sign   = 0;   ///< 4-of-7
-    uint64_t ringtail_dkg   = 0;   ///< 4-of-7
+    uint64_t corona_dkg   = 0;   ///< 4-of-7
 };
 
 // Per-round chunks that fit inside the arena.
@@ -155,13 +155,13 @@ void append_cggmp21_sign(std::vector<CeremonyOp>& begins,
     }
 }
 
-void append_ringtail_dkg(std::vector<CeremonyOp>& begins,
+void append_corona_dkg(std::vector<CeremonyOp>& begins,
                          std::vector<ContributionOp>& contribs,
                          uint64_t& cid, uint64_t count)
 {
     for (uint64_t i = 0; i < count; ++i, ++cid) {
         begins.push_back(make_begin(cid, 4u, 7u,
-            static_cast<uint32_t>(CeremonyKind::RingtailDkg),
+            static_cast<uint32_t>(CeremonyKind::CoronaDkg),
             uint8_t(0xE0 + (cid & 0x0F))));
         for (uint32_t h = 0; h < 4u; ++h) {
             contribs.push_back(make_contribution(cid, 0u, h,
@@ -178,10 +178,10 @@ std::vector<Workload> shape_to_chunks(const std::string& name,
     std::vector<Workload> chunks;
     uint64_t cid = 1ULL;
     uint64_t total = s.frost_keygen + s.frost_sign + s.cggmp21_keygen
-                   + s.cggmp21_sign + s.ringtail_dkg;
+                   + s.cggmp21_sign + s.corona_dkg;
     uint64_t produced = 0;
     uint64_t fk = s.frost_keygen, fs = s.frost_sign;
-    uint64_t ck = s.cggmp21_keygen, cs = s.cggmp21_sign, rd = s.ringtail_dkg;
+    uint64_t ck = s.cggmp21_keygen, cs = s.cggmp21_sign, rd = s.corona_dkg;
 
     auto take = [&](uint64_t& remaining, uint64_t want, auto append_fn,
                     std::vector<CeremonyOp>& begins,
@@ -213,7 +213,7 @@ std::vector<Workload> shape_to_chunks(const std::string& name,
         if (step) { advanced = true; produced += step; }
         step = take(cs, 64, append_cggmp21_sign,    w.begins, w.contribs, 4);
         if (step) { advanced = true; produced += step; }
-        step = take(rd, 32, append_ringtail_dkg,    w.begins, w.contribs, 4);
+        step = take(rd, 32, append_corona_dkg,    w.begins, w.contribs, 4);
         if (step) { advanced = true; produced += step; }
         if (!advanced) {
             // No scheme could fit any more; flush bigger chunks via single-scheme
@@ -226,7 +226,7 @@ std::vector<Workload> shape_to_chunks(const std::string& name,
             produced += step;
             step = take(cs, cs, append_cggmp21_sign,   w.begins, w.contribs, 4);
             produced += step;
-            step = take(rd, rd, append_ringtail_dkg,   w.begins, w.contribs, 4);
+            step = take(rd, rd, append_corona_dkg,   w.begins, w.contribs, 4);
             produced += step;
             if (w.begins.empty()) break;  // safety
         }
@@ -464,7 +464,7 @@ int main()
         { "micro.frost_sign",     {   0, 100, 0, 0, 0 } },
         { "micro.cggmp21_keygen", {   0, 0, 100, 0, 0 } },
         { "micro.cggmp21_sign",   {   0, 0, 0, 100, 0 } },
-        { "micro.ringtail_dkg",   {   0, 0, 0, 0, 100 } },
+        { "micro.corona_dkg",   {   0, 0, 0, 0, 100 } },
     };
 
     // ---------- mixed-workload macrobenchmarks ---------------------------
@@ -476,15 +476,15 @@ int main()
         // medium: 100 × FROST keygen + 100 × CGGMP21 keygen
         { "medium",
           { /*frost_keygen=*/100,   0, /*cggmp21_keygen=*/100, 0, 0 } },
-        // large: 200 each of FROST kg, CGGMP21 kg, Ringtail DKG (sized to
+        // large: 200 each of FROST kg, CGGMP21 kg, Corona DKG (sized to
         // saturate one round across the arena while leaving headroom).
         { "large",
-          { /*frost_keygen=*/200,   0, /*cggmp21_keygen=*/200, 0, /*ringtail_dkg=*/200 } },
+          { /*frost_keygen=*/200,   0, /*cggmp21_keygen=*/200, 0, /*corona_dkg=*/200 } },
         // xlarge: 1000 mixed ceremonies (balanced across schemes; 5 chunks)
         { "xlarge",
           { /*frost_keygen=*/250, /*frost_sign=*/250,
             /*cggmp21_keygen=*/150, /*cggmp21_sign=*/150,
-            /*ringtail_dkg=*/200 } },
+            /*corona_dkg=*/200 } },
     };
 
     for (const auto& sc : micro) run_scenario(sc, metal.get(), wgpu.get());

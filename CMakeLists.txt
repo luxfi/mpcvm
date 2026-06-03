@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # MPCVM (M-Chain) GPU substrate.
-# v0.60: FROST + CGGMP21 + Ringtail threshold ceremonies, GPU-native
+# v0.60: FROST + CGGMP21 + Corona threshold ceremonies, GPU-native
 #        across CUDA + Metal + WGSL with byte-for-byte cross-backend
 #        determinism against a CPU reference oracle.
 
@@ -42,6 +42,22 @@ if(LUX_MPCVM_WGPU_INCLUDE_DIR AND LUX_MPCVM_WGPU_LIBRARY)
     set(_LUX_MPCVM_WGPU_DEFAULT ON)
 endif()
 option(LUX_MPCVM_ENABLE_WGPU "Build WebGPU/wgpu-native backend" ${_LUX_MPCVM_WGPU_DEFAULT})
+
+# Kernel source dirs — canonical homes are one-per-backend
+# (luxcpp/metal/src/shaders/mpcvm, luxcpp/cuda/kernels/mpcvm,
+# luxcpp/webgpu/kernels/wgsl/mpcvm). Override via -D<VAR>=<dir>.
+if(NOT LUX_MPCVM_KERNEL_DIR_METAL)
+    set(LUX_MPCVM_KERNEL_DIR_METAL
+        "${CMAKE_CURRENT_SOURCE_DIR}/../metal/src/shaders/mpcvm")
+endif()
+if(NOT LUX_MPCVM_KERNEL_DIR_CUDA)
+    set(LUX_MPCVM_KERNEL_DIR_CUDA
+        "${CMAKE_CURRENT_SOURCE_DIR}/../cuda/kernels/mpcvm")
+endif()
+if(NOT LUX_MPCVM_KERNEL_DIR_WGSL)
+    set(LUX_MPCVM_KERNEL_DIR_WGSL
+        "${CMAKE_CURRENT_SOURCE_DIR}/../webgpu/kernels/wgsl/mpcvm")
+endif()
 
 # ---- core library (host code: layout + CPU reference) --------------------
 
@@ -83,10 +99,10 @@ if(LUX_MPCVM_ENABLE_METAL AND APPLE)
         mpcvm_ceremony.metal
         mpcvm_frost.metal
         mpcvm_cggmp21.metal
-        mpcvm_ringtail.metal
+        mpcvm_corona.metal
         mpcvm_transition.metal)
         configure_file(
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/${src}
+            ${LUX_MPCVM_KERNEL_DIR_METAL}/${src}
             ${CMAKE_CURRENT_BINARY_DIR}/src/${src}
             COPYONLY)
     endforeach()
@@ -94,14 +110,14 @@ if(LUX_MPCVM_ENABLE_METAL AND APPLE)
     set(MPCVM_METAL_COMBINED ${CMAKE_CURRENT_BINARY_DIR}/src/mpcvm_combined.metal)
     add_custom_command(
         OUTPUT ${MPCVM_METAL_COMBINED}
-        COMMAND bash -c "cat ${CMAKE_CURRENT_SOURCE_DIR}/src/mpcvm_kernels_common.h.metal > ${MPCVM_METAL_COMBINED} && for f in mpcvm_ceremony.metal mpcvm_transition.metal mpcvm_frost.metal mpcvm_cggmp21.metal mpcvm_ringtail.metal; do grep -v 'mpcvm_kernels_common.h.metal' ${CMAKE_CURRENT_SOURCE_DIR}/src/$f >> ${MPCVM_METAL_COMBINED}; done"
+        COMMAND bash -c "cat ${LUX_MPCVM_KERNEL_DIR_METAL}/mpcvm_kernels_common.h.metal > ${MPCVM_METAL_COMBINED} && for f in mpcvm_ceremony.metal mpcvm_transition.metal mpcvm_frost.metal mpcvm_cggmp21.metal mpcvm_corona.metal; do grep -v 'mpcvm_kernels_common.h.metal' ${LUX_MPCVM_KERNEL_DIR_METAL}/$f >> ${MPCVM_METAL_COMBINED}; done"
         DEPENDS
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/mpcvm_kernels_common.h.metal
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/mpcvm_ceremony.metal
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/mpcvm_transition.metal
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/mpcvm_frost.metal
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/mpcvm_cggmp21.metal
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/mpcvm_ringtail.metal
+            ${LUX_MPCVM_KERNEL_DIR_METAL}/mpcvm_kernels_common.h.metal
+            ${LUX_MPCVM_KERNEL_DIR_METAL}/mpcvm_ceremony.metal
+            ${LUX_MPCVM_KERNEL_DIR_METAL}/mpcvm_transition.metal
+            ${LUX_MPCVM_KERNEL_DIR_METAL}/mpcvm_frost.metal
+            ${LUX_MPCVM_KERNEL_DIR_METAL}/mpcvm_cggmp21.metal
+            ${LUX_MPCVM_KERNEL_DIR_METAL}/mpcvm_corona.metal
         VERBATIM)
 
     set(MPCVM_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/src/mpcvm_combined.air)
@@ -132,11 +148,11 @@ if(LUX_MPCVM_ENABLE_CUDA)
     enable_language(CUDA)
     add_library(lux_mpcvm_cuda STATIC
         src/mpcvm_gpu_engine_cuda.cpp
-        src/mpcvm_ceremony.cu
-        src/mpcvm_frost.cu
-        src/mpcvm_cggmp21.cu
-        src/mpcvm_ringtail.cu
-        src/mpcvm_transition.cu
+        ${LUX_MPCVM_KERNEL_DIR_CUDA}/mpcvm_ceremony.cu
+        ${LUX_MPCVM_KERNEL_DIR_CUDA}/mpcvm_frost.cu
+        ${LUX_MPCVM_KERNEL_DIR_CUDA}/mpcvm_cggmp21.cu
+        ${LUX_MPCVM_KERNEL_DIR_CUDA}/mpcvm_corona.cu
+        ${LUX_MPCVM_KERNEL_DIR_CUDA}/mpcvm_transition.cu
     )
     target_include_directories(lux_mpcvm_cuda PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -188,7 +204,7 @@ if(LUX_MPCVM_ENABLE_WGPU)
         mpcvm_ceremony.wgsl
         mpcvm_transition.wgsl)
         configure_file(
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/${src}
+            ${LUX_MPCVM_KERNEL_DIR_WGSL}/${src}
             ${CMAKE_CURRENT_BINARY_DIR}/src/${src}
             COPYONLY)
     endforeach()
