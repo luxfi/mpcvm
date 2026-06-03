@@ -9,7 +9,7 @@
 /// GPU and the canonical state-machine transitions also run on the GPU.
 /// This is what closes the LP-137 gap from "GPU-resident" to "GPU-native"
 /// for threshold MPC: a small dedicated set of ceremony kernels (FROST,
-/// CGGMP21, Ringtail) plus a shared state machine, all matching a
+/// CGGMP21, Corona) plus a shared state machine, all matching a
 /// deterministic CPU reference byte-for-byte across CPU/Metal/CUDA/WGSL.
 ///
 ///   mpcvm/                              the substrate this header describes
@@ -21,7 +21,7 @@
 /// Round model — one MPCVMTransitionRound covers:
 ///   * FrostKeygen / FrostSign       : threshold-Schnorr ceremonies
 ///   * Cggmp21Keygen / Cggmp21Sign   : threshold-ECDSA ceremonies
-///   * RingtailDkg / RingtailSign    : threshold-lattice ceremonies (link
+///   * CoronaDkg / CoronaSign    : threshold-lattice ceremonies (link
 ///                                     to existing lattice GPU)
 ///   * CeremonyStateMachine          : round advance, timeout, dedup
 ///   * MpcvmTransition               : emit ceremony_root, key_share_root,
@@ -65,7 +65,7 @@ enum class ResidencyClass : uint32_t {
 // kind:
 //   0 frost-keygen     1 frost-sign
 //   2 cggmp21-keygen   3 cggmp21-sign
-//   4 ringtail-dkg     5 ringtail-sign
+//   4 corona-dkg     5 corona-sign
 //
 // status:
 //   0 free        1 in_progress
@@ -76,8 +76,8 @@ enum class CeremonyKind : uint32_t {
     FrostSign       = 1,
     Cggmp21Keygen   = 2,
     Cggmp21Sign     = 3,
-    RingtailDkg     = 4,
-    RingtailSign    = 5,
+    CoronaDkg     = 4,
+    CoronaSign    = 5,
 };
 
 constexpr uint32_t kCeremonyStatusFree       = 0u;
@@ -112,12 +112,12 @@ inline constexpr uint32_t kDefaultCeremonySlots = 256u;
 // by a successful keygen. share_data holds the scheme-specific payload:
 //   FROST    : 32-byte secret-share scalar + 33-byte public-key share
 //   CGGMP21  : 32-byte secret-share scalar + 33-byte public-key share
-//   Ringtail : up to 256-byte module-LWE secret + 32-byte commitment
+//   Corona : up to 256-byte module-LWE secret + 32-byte commitment
 
 enum class ShareScheme : uint32_t {
     Frost    = 0,
     Cggmp21  = 1,
-    Ringtail = 2,
+    Corona = 2,
 };
 
 inline constexpr uint32_t kKeyShareDataMax = 320u;  ///< max per-share payload
@@ -195,8 +195,8 @@ enum class MPCVMTransitionMode : uint32_t {
     FrostSign        = 1,
     Cggmp21Keygen    = 2,
     Cggmp21Sign      = 3,
-    RingtailDkg      = 4,
-    RingtailSign     = 5,
+    CoronaDkg      = 4,
+    CoronaSign     = 5,
     CeremonyStep     = 6,   ///< advance-round / timeout sweep / dedup
     FullRound        = 7,   ///< chain ceremony-step + transition
 };
@@ -289,7 +289,7 @@ inline constexpr uint32_t kFrostKeygenRounds   = 3u;   ///< commitment, broadcas
 inline constexpr uint32_t kFrostSignRounds     = 2u;   ///< nonce, partial-sign
 inline constexpr uint32_t kCggmp21KeygenRounds = 3u;
 inline constexpr uint32_t kCggmp21SignRounds   = 5u;   ///< 4 offline + 1 online
-inline constexpr uint32_t kRingtailDkgRounds   = 2u;
-inline constexpr uint32_t kRingtailSignRounds  = 2u;
+inline constexpr uint32_t kCoronaDkgRounds   = 2u;
+inline constexpr uint32_t kCoronaSignRounds  = 2u;
 
 }  // namespace mpcvm::gpu

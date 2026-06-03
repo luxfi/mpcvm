@@ -25,7 +25,7 @@
 ///                        bound to the ceremony's seed (preventing replay).
 /// The full Ed25519 / secp256k1 / lattice arithmetic for actual signing is
 /// performed by host-side verifiers that consume these shares (see
-/// quasar_ringtail_verifier.{hpp,cpp} for the analogous lattice path).
+/// quasar_corona_verifier.{hpp,cpp} for the analogous lattice path).
 
 #include "lux/mpcvm/mpcvm_cpu_reference.hpp"
 
@@ -237,8 +237,8 @@ uint32_t total_rounds_for(uint32_t kind)
         case CeremonyKind::FrostSign:      return kFrostSignRounds;
         case CeremonyKind::Cggmp21Keygen:  return kCggmp21KeygenRounds;
         case CeremonyKind::Cggmp21Sign:    return kCggmp21SignRounds;
-        case CeremonyKind::RingtailDkg:    return kRingtailDkgRounds;
-        case CeremonyKind::RingtailSign:   return kRingtailSignRounds;
+        case CeremonyKind::CoronaDkg:    return kCoronaDkgRounds;
+        case CeremonyKind::CoronaSign:   return kCoronaSignRounds;
         default: return 1u;
     }
 }
@@ -248,7 +248,7 @@ bool is_keygen_kind(uint32_t kind)
     auto k = static_cast<CeremonyKind>(kind);
     return k == CeremonyKind::FrostKeygen
         || k == CeremonyKind::Cggmp21Keygen
-        || k == CeremonyKind::RingtailDkg;
+        || k == CeremonyKind::CoronaDkg;
 }
 
 uint32_t scheme_for_kind(uint32_t kind)
@@ -258,14 +258,14 @@ uint32_t scheme_for_kind(uint32_t kind)
         return uint32_t(ShareScheme::Frost);
     if (k == CeremonyKind::Cggmp21Keygen || k == CeremonyKind::Cggmp21Sign)
         return uint32_t(ShareScheme::Cggmp21);
-    return uint32_t(ShareScheme::Ringtail);
+    return uint32_t(ShareScheme::Corona);
 }
 
 uint32_t share_data_len_for_scheme(uint32_t scheme)
 {
     if (scheme == uint32_t(ShareScheme::Frost))    return 65u;  // 32 secret + 33 pub
     if (scheme == uint32_t(ShareScheme::Cggmp21))  return 65u;  // 32 secret + 33 pub
-    return 256u;  // Ringtail Module-LWE secret + 32 pub
+    return 256u;  // Corona Module-LWE secret + 32 pub
 }
 
 // Count contributions in the current round for a ceremony.
@@ -680,8 +680,8 @@ MPCVMTransitionResult run_reference(MPCVMReferenceState& state,
         || mode == MPCVMTransitionMode::FrostSign
         || mode == MPCVMTransitionMode::Cggmp21Keygen
         || mode == MPCVMTransitionMode::Cggmp21Sign
-        || mode == MPCVMTransitionMode::RingtailDkg
-        || mode == MPCVMTransitionMode::RingtailSign) {
+        || mode == MPCVMTransitionMode::CoronaDkg
+        || mode == MPCVMTransitionMode::CoronaSign) {
         r.ceremony_apply_count    = apply_ceremony_ops(state, ceremony_ops);
         r.contribution_apply_count = apply_contribution_ops(state, contribution_ops);
         run_ceremony_step(state, desc, r);

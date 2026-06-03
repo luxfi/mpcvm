@@ -87,7 +87,7 @@ id<MTLLibrary> compile_mpcvm_library(id<MTLDevice> device)
         k_tr   = load_file(dir / "mpcvm_transition.metal");
         k_fr   = load_file(dir / "mpcvm_frost.metal");
         k_cg   = load_file(dir / "mpcvm_cggmp21.metal");
-        k_rt   = load_file(dir / "mpcvm_ringtail.metal");
+        k_rt   = load_file(dir / "mpcvm_corona.metal");
         if (common && k_cer && k_tr && k_fr && k_cg && k_rt) break;
     }
     if (!common || !k_cer || !k_tr || !k_fr || !k_cg || !k_rt) {
