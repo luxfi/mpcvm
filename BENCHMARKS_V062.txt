@@ -19,10 +19,10 @@ SCENARIO	micro.cggmp21_sign	ceremonies=100	contribs=400	chunks=2
 ROW	micro.cggmp21_sign	cpu	100	400	5.751	5.717	5.957	5.983	17389.5	69558.1	1.00x
 ROW	micro.cggmp21_sign	metal	100	400	41.326	41.220	41.530	41.547	2419.8	9679.2	0.14x
 ROW	micro.cggmp21_sign	wgpu	100	400	190.251	189.340	192.470	192.802	525.6	2102.5	0.03x
-SCENARIO	micro.ringtail_dkg	ceremonies=100	contribs=400	chunks=4
-ROW	micro.ringtail_dkg	cpu	100	400	8.809	8.779	8.872	8.879	11351.9	45407.5	1.00x
-ROW	micro.ringtail_dkg	metal	100	400	57.283	57.239	57.405	57.412	1745.7	6982.9	0.15x
-ROW	micro.ringtail_dkg	wgpu	100	400	209.883	209.647	211.055	211.268	476.5	1905.8	0.04x
+SCENARIO	micro.corona_dkg	ceremonies=100	contribs=400	chunks=4
+ROW	micro.corona_dkg	cpu	100	400	8.809	8.779	8.872	8.879	11351.9	45407.5	1.00x
+ROW	micro.corona_dkg	metal	100	400	57.283	57.239	57.405	57.412	1745.7	6982.9	0.15x
+ROW	micro.corona_dkg	wgpu	100	400	209.883	209.647	211.055	211.268	476.5	1905.8	0.04x
 SCENARIO	small	ceremonies=10	contribs=70	chunks=1
 ROW	small	cpu	10	70	0.914	0.903	0.937	0.937	10946.5	76625.6	1.00x
 ROW	small	metal	10	70	9.075	9.105	9.216	9.220	1102.0	7713.8	0.10x

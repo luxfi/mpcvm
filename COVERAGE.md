@@ -54,8 +54,8 @@ through every determinism workload below.
 * FROST 7-of-10 sign completes 2 rounds, no shares.
 * CGGMP21 5-of-9 keygen finalises 3 rounds with 5 shares.
 * CGGMP21 sign 5 rounds (no shares).
-* Ringtail DKG 2 rounds → 3 lattice shares.
-* Ringtail sign 2 rounds.
+* Corona DKG 2 rounds → 3 lattice shares.
+* Corona sign 2 rounds.
 * Replay rejected (same `(ceremony, round, holder)` dropped).
 * Timeout marks ceremony `failed`.
 * 3-way concurrent ceremonies, deterministic across runs.
