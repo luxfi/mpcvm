@@ -45,7 +45,7 @@ CPU↔WGPU at small/medium/large/xlarge).
 | FROST sign 5-of-7   |   6.9 ms |     48.3 ms |   225.2 ms | 0.142×       | 0.030×      |
 | CGGMP21 keygen 5-of-9|  6.9 ms |     48.4 ms |   225.6 ms | 0.142×       | 0.031×      |
 | CGGMP21 sign 4-of-7 |   5.6 ms |     41.3 ms |   190.4 ms | 0.136×       | 0.030×      |
-| Ringtail DKG 4-of-7 |   8.8 ms |     57.3 ms |   209.9 ms | 0.153×       | 0.042×      |
+| Corona DKG 4-of-7 |   8.8 ms |     57.3 ms |   209.9 ms | 0.153×       | 0.042×      |
 
 Throughput (ceremonies / sec, mean):
 
@@ -55,7 +55,7 @@ Throughput (ceremonies / sec, mean):
 | FROST sign          | 14,582.1  |   2,069.0 |     444.1 |
 | CGGMP21 keygen      | 14,516.7  |   2,064.2 |     443.2 |
 | CGGMP21 sign        | 17,740.5  |   2,418.8 |     525.1 |
-| Ringtail DKG        | 11,371.4  |   1,744.0 |     476.3 |
+| Corona DKG        | 11,371.4  |   1,744.0 |     476.3 |
 
 ## Mixed-workload macrobenchmarks (v0.62)
 
@@ -76,7 +76,7 @@ Microbenchmarks (mean ms, lower is better):
 | FROST sign          |      204.3 ms |     48.3 ms | **4.23×**     |     628.6 ms |   225.2 ms | **2.79×**    |
 | CGGMP21 keygen      |      182.4 ms |     48.4 ms | **3.77×**     |     623.3 ms |   225.6 ms | **2.76×**    |
 | CGGMP21 sign        |      293.1 ms |     41.3 ms | **7.10×**     |     782.3 ms |   190.4 ms | **4.11×**    |
-| Ringtail DKG        |      239.1 ms |     57.3 ms | **4.17×**     |     900.0 ms |   209.9 ms | **4.29×**    |
+| Corona DKG        |      239.1 ms |     57.3 ms | **4.17×**     |     900.0 ms |   209.9 ms | **4.29×**    |
 
 Macrobenchmarks (mean ms):
 
