@@ -6,3 +6,5 @@ build-*/
 *.metallib
 .cache/
 .DS_Store
+build.log
+cfg.log
